@@ -1245,10 +1245,163 @@ def alert_target_resource_types(alert):
     return {str(item).lower() for item in target_types if item}
 
 def alert_targets_resource(alert, resource):
-    """Match an alert only when it is scoped directly to this resource."""
-    resource_id = str(resource.get("id") or resource.get("resourceId") or "")
+    """
+    Determine whether an alert applies to the Azure resource.
+
+    Supports:
+      1. Direct resource-level alert scope
+      2. Resource-group scoped alerts targeting the resource type
+      3. Subscription scoped alerts targeting the resource type
+
+    Applies to:
+      - Metric Alerts
+      - Activity Log Alerts
+      - Log Query / Scheduled Query Alerts
+    """
+
+    resource_id = str(
+        resource.get("id") or resource.get("resourceId") or ""
+    ).strip()
+
+    if not resource_id:
+        return False
+
+    resource_id_lower = resource_id.lower()
+
+    # Azure resource type, for example:
+    # Microsoft.Compute/virtualMachines
+    # Microsoft.App/managedEnvironments
+    resource_type = str(
+        resource.get("type") or ""
+    ).strip().lower()
+
+    # Resource group
+    resource_rg = str(
+        resource.get("resourceGroup")
+        or resource.get("resource_group")
+        or ""
+    ).strip().lower()
+
+    # Subscription ID from resource ID
+    subscription_id = ""
+    id_parts = resource_id_lower.split("/")
+
+    try:
+        subscription_index = id_parts.index("subscriptions")
+        subscription_id = id_parts[subscription_index + 1]
+    except (ValueError, IndexError):
+        pass
+
     scopes = alert_scopes(alert)
-    return any(scope_is_exact_resource(scope, resource_id) for scope in scopes)
+
+    # ================================================================
+    # 1. DIRECT RESOURCE SCOPE
+    # ================================================================
+    #
+    # This is the existing behaviour and preserves your working
+    # VM metric-alert detection.
+    #
+    for scope in scopes:
+        scope = str(scope or "").strip().lower().rstrip("/")
+
+        if not scope:
+            continue
+
+        if scope == resource_id_lower.rstrip("/"):
+            return True
+
+    # ================================================================
+    # 2. DETERMINE RESOURCE TYPES TARGETED BY THE ALERT
+    # ================================================================
+    #
+    # alert_target_resource_types() already handles:
+    #
+    # - targetResourceType
+    # - targetResourceTypes
+    # - Activity Log condition.allOf -> resourceType
+    # - Activity Log operationName
+    #
+    target_types = alert_target_resource_types(alert)
+
+    target_types = {
+        str(item).strip().lower().rstrip("/")
+        for item in target_types
+        if str(item).strip()
+    }
+
+    # If the resource has no type, we cannot safely perform
+    # resource-type matching.
+    if not resource_type or not target_types:
+        return False
+
+    # Exact or compatible Azure resource type match
+    type_matches = (
+        resource_type in target_types
+        or any(
+            resource_type.endswith("/" + target_type)
+            for target_type in target_types
+        )
+    )
+
+    if not type_matches:
+        return False
+
+    # ================================================================
+    # 3. RESOURCE-GROUP SCOPED ALERT
+    # ================================================================
+    #
+    # Example:
+    #
+    # Alert scope:
+    # /subscriptions/xxx/resourceGroups/rg-monitoring
+    #
+    # Resource:
+    # /subscriptions/xxx/resourceGroups/rg-monitoring/providers/
+    # Microsoft.App/managedEnvironments/cae-01
+    #
+    # If the alert explicitly targets Microsoft.App/managedEnvironments,
+    # then it applies to this resource.
+    #
+    if resource_rg:
+        expected_rg_scope = (
+            f"/subscriptions/{subscription_id}/resourcegroups/{resource_rg}"
+            if subscription_id
+            else ""
+        )
+
+        for scope in scopes:
+            scope = str(scope or "").strip().lower().rstrip("/")
+
+            if expected_rg_scope and scope == expected_rg_scope:
+                return True
+
+    # ================================================================
+    # 4. SUBSCRIPTION SCOPED ALERT
+    # ================================================================
+    #
+    # Example:
+    #
+    # Alert scope:
+    # /subscriptions/xxx
+    #
+    # Target resource type:
+    # Microsoft.App/managedEnvironments
+    #
+    # Resource:
+    # Microsoft.App/managedEnvironments/cae-01
+    #
+    if subscription_id:
+        expected_subscription_scope = (
+            f"/subscriptions/{subscription_id}"
+        )
+
+        for scope in scopes:
+            scope = str(scope or "").strip().lower().rstrip("/")
+
+            if scope == expected_subscription_scope:
+                return True
+
+    return False
 
 def resource_alert_status(resource, alerts):
     groups = {"Metric": [], "Activity Log": [], "Log Query": []}
