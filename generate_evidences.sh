@@ -26,6 +26,9 @@
 #   HLD_APPROVER="TBD"
 #   HLD_CLASSIFICATION="Confidential"
 #   HLD_REGION="UAE North"
+#   REUSE_INVENTORY="1" to skip Azure discovery and reuse inventory.json
+#   MG_STRUCTURE_FILE="./management_group_structure.txt" for portal-pasted evidence
+#   MG_STRUCTURE_IMAGE="./management_group_structure.png" for portal screenshot evidence
 #
 # Notes:
 #   - Read-only discovery only. No Azure resources are changed.
@@ -83,6 +86,19 @@ RESOURCES="./resources.json"
 
 echo "Discovering Management Group hierarchy: $MG_ID"
 
+export MG_ID DISCOVERY INVENTORY
+
+if [[ "${REUSE_INVENTORY:-0}" == "1" ]]; then
+    if [[ ! -f "$INVENTORY" && -f "$RESOURCES" ]]; then
+        INVENTORY="$RESOURCES"
+        export INVENTORY
+    fi
+    if [[ ! -f "$INVENTORY" ]]; then
+        echo "ERROR: REUSE_INVENTORY=1 but neither $INVENTORY nor $RESOURCES was found."
+        exit 1
+    fi
+    echo "Reusing existing inventory: $INVENTORY"
+else
 # --expand --recurse returns the management-group tree including descendants.
 if ! az account management-group show \
       --name "$MG_ID" \
@@ -95,20 +111,6 @@ if ! az account management-group show \
 
   echo "{}" > "$DISCOVERY"
 fi
-
-
-export MG_ID DISCOVERY INVENTORY
-
-
-echo "Checking python-docx..."
-
-python3 -c "import docx" >/dev/null 2>&1 || {
-
-    echo "Installing python-docx..."
-
-    python3 -m pip install --user python-docx
-
-}
 
 
 python3 - <<'PY'
@@ -901,10 +903,23 @@ Path("resources.json").write_text(
 
 print(f"Discovered {len(subs)} subscription(s).", file=sys.stderr)
 PY
+fi
 
 echo "Generating Word HLD..."
 
+echo "Checking python-docx..."
+
+python3 -c "import docx" >/dev/null 2>&1 || {
+
+    echo "Installing python-docx..."
+
+    python3 -m pip install --user python-docx
+
+}
+
 export TEMPLATE OUTPUT INVENTORY
+export MG_STRUCTURE_FILE="${MG_STRUCTURE_FILE:-./management_group_structure.txt}"
+export MG_STRUCTURE_IMAGE="${MG_STRUCTURE_IMAGE:-./management_group_structure.png}"
 python3 - <<'PY'
 import json, os, re, copy, sys
 from pathlib import Path
@@ -986,6 +1001,40 @@ def add_para(text="", style=None):
     p.add_run(str(text))
     return p
 
+def add_text_evidence(path, heading, level=2):
+    if not path.exists():
+        return False
+    content = path.read_text(encoding="utf-8").strip()
+    if not content:
+        return False
+    add_heading(heading, level)
+    add_para(
+        "This evidence was pasted from the Azure Portal Management Groups view. "
+        "It is included as supplied and is not used to recreate or modify Azure Management Groups."
+    )
+    for line in content.splitlines():
+        paragraph = doc.add_paragraph()
+        run = paragraph.add_run(line)
+        run.font.name = "Consolas"
+        run.font.size = Pt(8)
+    return True
+
+def add_image_evidence(path, heading, caption):
+    if not path.exists():
+        return False
+    try:
+        add_heading(heading, 3)
+        add_para(
+            "This screenshot was captured from the Azure Portal Management Groups view. "
+            "It is included as supplied and is not used to recreate or modify Azure Management Groups."
+        )
+        doc.add_picture(str(path), width=Inches(6.4))
+        add_caption(caption)
+        return True
+    except Exception as error:
+        add_para(f"Management Group screenshot could not be embedded: {error}")
+        return False
+
 def add_bullets(items):
 
     for item in items:
@@ -1027,19 +1076,8 @@ def monitoring_coverage(resource_type, resources, metric_alerts, diagnostics):
     total_resources = len(resources or [])
     alert_scope_ids = set()
     for alert in metric_alerts or []:
-        scopes = alert.get("scopes") or []
-        if isinstance(scopes, str):
-            scopes = [scopes]
-        for scope in scopes or []:
-            if isinstance(scope, str):
-                alert_scope_ids.add(scope.lower())
-        props = alert.get("properties") or {}
-        scopes = props.get("scopes") or []
-        if isinstance(scopes, str):
-            scopes = [scopes]
-        for scope in scopes or []:
-            if isinstance(scope, str):
-                alert_scope_ids.add(scope.lower())
+        for scope in alert_scopes(alert):
+            alert_scope_ids.add(scope)
 
     diag_by_id = {}
     for diag in diagnostics or []:
@@ -1053,7 +1091,7 @@ def monitoring_coverage(resource_type, resources, metric_alerts, diagnostics):
     resources_with_diagnostics = 0
     for resource in resources or []:
         rid = str(resource.get("id") or resource.get("resourceId") or "").lower()
-        if rid and rid in alert_scope_ids:
+        if rid and any(scope_applies(scope, rid) for scope in alert_scope_ids):
             resources_with_alerts += 1
         if rid and rid in diag_by_id and bool(diag_by_id[rid].get("diagnosticsEnabled")):
             resources_with_diagnostics += 1
@@ -1068,6 +1106,67 @@ def monitoring_coverage(resource_type, resources, metric_alerts, diagnostics):
         "alertCoveragePct": alert_coverage,
         "diagnosticCoveragePct": diag_coverage,
     }
+
+def alert_scopes(alert):
+    values = []
+    if not isinstance(alert, dict):
+        return values
+    values.extend(alert.get("scopes") or [])
+    properties = alert.get("properties") or {}
+    if isinstance(properties, dict):
+        values.extend(properties.get("scopes") or [])
+        condition = properties.get("condition") or {}
+        if isinstance(condition, dict):
+            values.extend(condition.get("allOf", []) or [])
+    normalized = []
+    for value in values:
+        if isinstance(value, str):
+            normalized.append(value.rstrip("/").lower())
+        elif isinstance(value, dict):
+            scope = value.get("scope") or value.get("resourceId")
+            if scope:
+                normalized.append(str(scope).rstrip("/").lower())
+    return sorted(set(normalized))
+
+def scope_applies(scope, resource_id):
+    scope = str(scope or "").rstrip("/").lower()
+    resource_id = str(resource_id or "").rstrip("/").lower()
+    return bool(scope and resource_id and (resource_id == scope or resource_id.startswith(scope + "/")))
+
+def alert_label(alert):
+    return alert.get("name") or alert.get("id", "").rstrip("/").split("/")[-1] or "Unnamed alert"
+
+def alert_type(alert):
+    resource_type = str(alert.get("type") or "").lower()
+    return "Activity Log" if "activitylogalerts" in resource_type else "Metric"
+
+def alert_enabled_value(alert):
+    properties = alert.get("properties") or {}
+    value = alert.get("enabled")
+    if value in (None, "") and isinstance(properties, dict):
+        value = properties.get("enabled", properties.get("enabledState"))
+    if isinstance(value, bool):
+        return "Yes" if value else "No"
+    return str(value or "Unknown")
+
+def alert_field_value(alert, field):
+    properties = alert.get("properties") or {}
+    value = alert.get(field)
+    if value is None or value == "":
+        if isinstance(properties, dict):
+            value = properties.get(field)
+    return "Unknown" if value is None or value == "" else str(value)
+
+def resource_alert_status(resource, alerts):
+    resource_id = str(resource.get("id") or resource.get("resourceId") or "")
+    matching_alerts = [
+        alert_label(alert)
+        for alert in alerts or []
+        if alert_enabled_value(alert) != "No"
+        and any(scope_applies(scope, resource_id) for scope in alert_scopes(alert))
+    ]
+    matching_alerts = sorted(set(matching_alerts))
+    return "Yes (" + "; ".join(matching_alerts) + ")" if matching_alerts else "No"
 
 subs = data.get("subscriptions", [])
 
@@ -2135,6 +2234,16 @@ add_table(
     [[s.get("management_group_path",""),s.get("display_name",""),s.get("subscription_id","")] for s in subs]
 )
 add_caption("Table 4: Management Group Structure")
+add_text_evidence(
+    Path(os.environ.get("MG_STRUCTURE_FILE", "./management_group_structure.txt")),
+    "3.2.1 Portal Management Group Structure Evidence",
+    level=3
+)
+add_image_evidence(
+    Path(os.environ.get("MG_STRUCTURE_IMAGE", "./management_group_structure.png")),
+    "3.2.2 Portal Management Group Screenshot Evidence",
+    "Figure: Management Group structure captured from the Azure Portal"
+)
 
 add_heading("3.3 Naming Convention", 2)
 add_para(
@@ -2535,18 +2644,10 @@ all_metric_alerts = []
 for s in subs:
     all_metric_alerts.extend(s.get("inventory", {}).get("metric_alerts", []) or [])
     all_metric_alerts.extend(s.get("inventory", {}).get("activity_log_alerts", []) or [])
-vm_alert_scope_ids = set()
-for alert in all_metric_alerts:
-    for scope in (alert.get("scopes") or []) or []:
-        vm_alert_scope_ids.add(str(scope).lower())
-    props = alert.get("properties") or {}
-    for scope in (props.get("scopes") or []) or []:
-        vm_alert_scope_ids.add(str(scope).lower())
 vm_rows=[]
 for s in subs:
     for vm in s.get("inventory", {}).get("vms", []) or []:
-        rid = str(vm.get("id") or "").lower()
-        alert_enabled = "Yes" if rid in vm_alert_scope_ids else "No"
+        alert_enabled = resource_alert_status(vm, all_metric_alerts)
         vm_rows.append([vm.get("name", ""), s.get("display_name", ""), alert_enabled])
 if vm_rows:
     add_table(["VM Name", "Subscription", "Alert Enabled"], vm_rows)
@@ -2558,12 +2659,7 @@ add_heading("10.4 Storage Monitoring", 2)
 storage_rows=[]
 for s in subs:
     for storage in s.get("inventory", {}).get("storage_accounts", []) or []:
-        rid = str(storage.get("id") or "").lower()
-        alert_scope_values = []
-        for alert in (s.get("inventory", {}).get("metric_alerts", []) or []) + (s.get("inventory", {}).get("activity_log_alerts", []) or []):
-            alert_scope_values.extend((alert.get("scopes") or []) or [])
-            alert_scope_values.extend((alert.get("properties") or {}).get("scopes", []) or [])
-        alert_enabled = "Yes" if any(str(scope).lower() == rid for scope in alert_scope_values) else "No"
+        alert_enabled = resource_alert_status(storage, all_metric_alerts)
         storage_rows.append([storage.get("name", ""), s.get("display_name", ""), alert_enabled])
 if storage_rows:
     add_table(["Storage Account", "Subscription", "Alert Enabled"], storage_rows)
@@ -2582,12 +2678,7 @@ for label, key in network_resource_sets:
     rows=[]
     for s in subs:
         for resource in s.get("inventory", {}).get(key, []) or []:
-            rid = str(resource.get("id") or "").lower()
-            alert_scope_values = []
-            for alert in (s.get("inventory", {}).get("metric_alerts", []) or []) + (s.get("inventory", {}).get("activity_log_alerts", []) or []):
-                alert_scope_values.extend((alert.get("scopes") or []) or [])
-                alert_scope_values.extend((alert.get("properties") or {}).get("scopes", []) or [])
-            alert_enabled = "Yes" if any(str(scope).lower() == rid for scope in alert_scope_values) else "No"
+            alert_enabled = resource_alert_status(resource, all_metric_alerts)
             rows.append([resource.get("name", ""), s.get("display_name", ""), alert_enabled])
     if rows:
         add_table(["Resource Name", "Subscription", "Alert Enabled"], rows)
@@ -2604,12 +2695,7 @@ for label, key in load_balancer_tables:
     rows=[]
     for s in subs:
         for resource in s.get("inventory", {}).get(key, []) or []:
-            rid = str(resource.get("id") or "").lower()
-            alert_scope_values = []
-            for alert in (s.get("inventory", {}).get("metric_alerts", []) or []) + (s.get("inventory", {}).get("activity_log_alerts", []) or []):
-                alert_scope_values.extend((alert.get("scopes") or []) or [])
-                alert_scope_values.extend((alert.get("properties") or {}).get("scopes", []) or [])
-            alert_enabled = "Yes" if any(str(scope).lower() == rid for scope in alert_scope_values) else "No"
+            alert_enabled = resource_alert_status(resource, all_metric_alerts)
             rows.append([resource.get("name", ""), s.get("display_name", ""), alert_enabled])
     if rows:
         add_table(["Resource Name", "Subscription", "Alert Enabled"], rows)
@@ -2645,23 +2731,19 @@ add_heading("Monitoring Alert Inventory", 2)
 alert_rows=[]
 for s in subs:
     for alert in (s.get("inventory", {}).get("metric_alerts", []) or []) + (s.get("inventory", {}).get("activity_log_alerts", []) or []):
-        scopes=[]
-        for scope in (alert.get("scopes") or []) or []:
-            scopes.append(str(scope))
         props = alert.get("properties") or {}
-        for scope in (props.get("scopes") or []) or []:
-            scopes.append(str(scope))
+        scopes = alert_scopes(alert)
         monitored = ", ".join([resource_name_from_id(scope) or scope for scope in scopes]) if scopes else (props.get("targetResourceType") or alert.get("targetResourceType") or "")
         alert_rows.append([
-            alert.get("name", ""),
+            alert_label(alert),
             s.get("display_name", ""),
-            alert.get("severity") or props.get("severity") or "",
-            str(alert.get("enabled", props.get("enabled", ""))),
+            alert_field_value(alert, "severity"),
+            alert_enabled_value(alert),
             monitored,
-            alert.get("type") or props.get("targetResourceType") or "",
+            alert_type(alert),
         ])
 if alert_rows:
-    add_table(["Alert Name", "Subscription", "Severity", "Enabled", "Monitored Resource", "Resource Type"], alert_rows)
+    add_table(["Alert Name", "Subscription", "Severity", "Enabled", "Monitored Resource", "Alert Type"], alert_rows)
     add_caption("Table 30: Monitoring Alert Inventory")
 
 # ---------------------------------------------------------------------------
