@@ -308,6 +308,7 @@ Resources
 | where type =~ 'microsoft.compute/disks'
 | extend VM = split(tostring(managedBy), '/')[-1]
 | project
+    id,
     name,
     resourceGroup,
     location,
@@ -704,6 +705,20 @@ for idx, s in enumerate(subs, 1):
         []
     )
 
+    # VM free-disk-space rules are commonly Log Alerts (scheduled query rules),
+    # rather than Metric Alerts. Collect them alongside the other alert types.
+    scheduled_query_alerts = az_for_sub(
+        sid,
+        ["monitor", "scheduled-query", "list"],
+        []
+    )
+    if not scheduled_query_alerts:
+        scheduled_query_alerts = az_for_sub(
+            sid,
+            ["resource", "list", "--resource-type", "Microsoft.Insights/scheduledQueryRules"],
+            []
+        )
+
     grafana = az_for_sub(
         sid,
         ["grafana","list"],
@@ -784,7 +799,8 @@ for idx, s in enumerate(subs, 1):
             "image": ((vm.get("storageProfile") or {}).get("imageReference") or {}),
             "zone": (vm.get("zones") or [""])[0] if vm.get("zones") else "",
             "public_access": public_access,
-            "id": vm.get("id","")
+            "id": vm.get("id",""),
+            "type": vm.get("type", "Microsoft.Compute/virtualMachines")
         })
 
     # Flatten subnet information.
@@ -863,6 +879,7 @@ for idx, s in enumerate(subs, 1):
         "network_watchers": network_watchers,
         "activity_log_alerts": activity_log_alerts,
         "metric_alerts": metric_alerts,
+        "scheduled_query_alerts": scheduled_query_alerts,
         "diagnostic_settings": diagnostic_settings,
         "grafana": grafana,
         "workbooks": workbooks,
@@ -946,7 +963,28 @@ doc = Document(str(template))
 # Helpers
 # ---------------------------------------------------------------------------
 def cell_text(cell, text):
-    cell.text = "" if text is None else str(text)
+    # A list value is rendered as a Word bullet list within a table cell. The
+    # first item is a status label; all following items are alert-rule bullets.
+    if isinstance(text, dict) and "alert_groups" in text:
+        cell.text = ""
+        cell.paragraphs[0].add_run(str(text.get("status", "Yes")))
+        for group_name, entries in text.get("alert_groups", []):
+            if not entries:
+                continue
+            group_paragraph = cell.add_paragraph()
+            group_run = group_paragraph.add_run(group_name)
+            group_run.bold = True
+            for entry in entries:
+                cell.add_paragraph(str(entry), style="List Bullet")
+    elif isinstance(text, (list, tuple)):
+        cell.text = ""
+        entries = [str(value) for value in text if value not in (None, "")]
+        if entries:
+            cell.paragraphs[0].add_run(entries[0])
+            for entry in entries[1:]:
+                cell.add_paragraph(entry, style="List Bullet")
+    else:
+        cell.text = "" if text is None else str(text)
     for p in cell.paragraphs:
         for r in p.runs:
             r.font.size = Pt(8.5)
@@ -1074,10 +1112,6 @@ def sub_from_id(rid):
 
 def monitoring_coverage(resource_type, resources, metric_alerts, diagnostics):
     total_resources = len(resources or [])
-    alert_scope_ids = set()
-    for alert in metric_alerts or []:
-        for scope in alert_scopes(alert):
-            alert_scope_ids.add(scope)
 
     diag_by_id = {}
     for diag in diagnostics or []:
@@ -1091,7 +1125,7 @@ def monitoring_coverage(resource_type, resources, metric_alerts, diagnostics):
     resources_with_diagnostics = 0
     for resource in resources or []:
         rid = str(resource.get("id") or resource.get("resourceId") or "").lower()
-        if rid and any(scope_applies(scope, rid) for scope in alert_scope_ids):
+        if rid and any(alert_targets_resource(alert, resource) for alert in metric_alerts or []):
             resources_with_alerts += 1
         if rid and rid in diag_by_id and bool(diag_by_id[rid].get("diagnosticsEnabled")):
             resources_with_diagnostics += 1
@@ -1133,12 +1167,27 @@ def scope_applies(scope, resource_id):
     resource_id = str(resource_id or "").rstrip("/").lower()
     return bool(scope and resource_id and (resource_id == scope or resource_id.startswith(scope + "/")))
 
+def scope_is_exact_resource(scope, resource_id):
+    """Return True only when an alert is scoped to this exact Azure resource.
+
+    Subscription- and resource-group-scoped alerts are valid alerts, but are not
+    resource alert rules.  Treating either as a match makes the same alert appear
+    against every resource below that parent scope.
+    """
+    scope = str(scope or "").rstrip("/").lower()
+    resource_id = str(resource_id or "").rstrip("/").lower()
+    return bool(scope and resource_id and scope == resource_id)
+
 def alert_label(alert):
     return alert.get("name") or alert.get("id", "").rstrip("/").split("/")[-1] or "Unnamed alert"
 
 def alert_type(alert):
     resource_type = str(alert.get("type") or "").lower()
-    return "Activity Log" if "activitylogalerts" in resource_type else "Metric"
+    if "activitylogalerts" in resource_type:
+        return "Activity Log"
+    if "scheduledqueryrules" in resource_type:
+        return "Log Query"
+    return "Metric"
 
 def alert_enabled_value(alert):
     properties = alert.get("properties") or {}
@@ -1147,6 +1196,10 @@ def alert_enabled_value(alert):
         value = properties.get("enabled", properties.get("enabledState"))
     if isinstance(value, bool):
         return "Yes" if value else "No"
+    if str(value or "").strip().lower() in {"true", "yes", "enabled"}:
+        return "Yes"
+    if str(value or "").strip().lower() in {"false", "no", "disabled"}:
+        return "No"
     return str(value or "Unknown")
 
 def alert_field_value(alert, field):
@@ -1157,16 +1210,59 @@ def alert_field_value(alert, field):
             value = properties.get(field)
     return "Unknown" if value is None or value == "" else str(value)
 
-def resource_alert_status(resource, alerts):
+def alert_target_resource_types(alert):
+    """Return Azure resource types explicitly targeted by an alert rule."""
+    properties = alert.get("properties") or {}
+    target_types = (
+        properties.get("targetResourceTypes")
+        or properties.get("targetResourceType")
+        or alert.get("targetResourceTypes")
+        or alert.get("targetResourceType")
+        or []
+    )
+    if isinstance(target_types, str):
+        target_types = [target_types]
+
+    # Activity Log Alerts store their resource-type filter in condition.allOf.
+    condition = properties.get("condition") or {}
+    if isinstance(condition, dict):
+        for item in condition.get("allOf", []) or []:
+            if not isinstance(item, dict):
+                continue
+            field = str(item.get("field") or "").replace("_", "").lower()
+            if field in {"resourcetype", "resource type"}:
+                value = item.get("equals") or item.get("containsAny") or item.get("contains") or []
+                target_types.extend(value if isinstance(value, list) else [value])
+            elif field in {"operationname", "operation name"}:
+                value = item.get("equals") or item.get("containsAny") or item.get("contains") or []
+                for operation in value if isinstance(value, list) else [value]:
+                    parts = str(operation or "").strip("/").split("/")
+                    # Azure operation names end in an action such as write,
+                    # delete, or action. The preceding provider/type path is
+                    # the target resource type.
+                    if len(parts) >= 3 and parts[-1].lower() in {"read", "write", "delete", "action"}:
+                        target_types.append("/".join(parts[:-1]))
+    return {str(item).lower() for item in target_types if item}
+
+def alert_targets_resource(alert, resource):
+    """Match an alert only when it is scoped directly to this resource."""
     resource_id = str(resource.get("id") or resource.get("resourceId") or "")
-    matching_alerts = [
-        alert_label(alert)
-        for alert in alerts or []
-        if alert_enabled_value(alert) != "No"
-        and any(scope_applies(scope, resource_id) for scope in alert_scopes(alert))
+    scopes = alert_scopes(alert)
+    return any(scope_is_exact_resource(scope, resource_id) for scope in scopes)
+
+def resource_alert_status(resource, alerts):
+    groups = {"Metric": [], "Activity Log": [], "Log Query": []}
+    for alert in alerts or []:
+        if alert_enabled_value(alert) != "Yes" or not alert_targets_resource(alert, resource):
+            continue
+        groups.setdefault(alert_type(alert), []).append(alert_label(alert))
+
+    alert_groups = [
+        ("Metric Alerts", sorted(set(groups["Metric"]))),
+        ("Activity Log Alerts", sorted(set(groups["Activity Log"]))),
+        ("Log Query Alerts", sorted(set(groups["Log Query"]))),
     ]
-    matching_alerts = sorted(set(matching_alerts))
-    return "Yes (" + "; ".join(matching_alerts) + ")" if matching_alerts else "No"
+    return {"status": "Yes", "alert_groups": alert_groups} if any(items for _, items in alert_groups) else "No"
 
 subs = data.get("subscriptions", [])
 
@@ -2640,32 +2736,35 @@ add_caption("Table 22: Monitoring Resources")
 render_catalog_section("10. Monitor")
 
 add_heading("10.3 Virtual Machines Monitoring", 2)
-all_metric_alerts = []
+resource_alert_rules = []
 for s in subs:
-    all_metric_alerts.extend(s.get("inventory", {}).get("metric_alerts", []) or [])
-    all_metric_alerts.extend(s.get("inventory", {}).get("activity_log_alerts", []) or [])
+    # Include direct Metric Alerts plus Log Query and Activity Log Alerts that
+    # explicitly target a resource type at subscription/resource-group scope.
+    resource_alert_rules.extend(s.get("inventory", {}).get("metric_alerts", []) or [])
+    resource_alert_rules.extend(s.get("inventory", {}).get("scheduled_query_alerts", []) or [])
+    resource_alert_rules.extend(s.get("inventory", {}).get("activity_log_alerts", []) or [])
 vm_rows=[]
 for s in subs:
     for vm in s.get("inventory", {}).get("vms", []) or []:
-        alert_enabled = resource_alert_status(vm, all_metric_alerts)
+        alert_enabled = resource_alert_status(vm, resource_alert_rules)
         vm_rows.append([vm.get("name", ""), s.get("display_name", ""), alert_enabled])
 if vm_rows:
     add_table(["VM Name", "Subscription", "Alert Enabled"], vm_rows)
     add_caption("Table 23: Virtual Machines Monitoring")
-vm_coverage = monitoring_coverage("Virtual Machines", [vm for s in subs for vm in (s.get("inventory", {}).get("vms", []) or [])], all_metric_alerts, [])
-add_para(f"Total VMs: {vm_coverage['totalResources']}; VMs With Alerts / Activity Metrics: {vm_coverage['resourcesWithAlerts']}.")
+vm_coverage = monitoring_coverage("Virtual Machines", [vm for s in subs for vm in (s.get("inventory", {}).get("vms", []) or [])], resource_alert_rules, [])
+add_para(f"Total VMs: {vm_coverage['totalResources']}; VMs With applicable alert rules: {vm_coverage['resourcesWithAlerts']}.")
 
 add_heading("10.4 Storage Monitoring", 2)
 storage_rows=[]
 for s in subs:
     for storage in s.get("inventory", {}).get("storage_accounts", []) or []:
-        alert_enabled = resource_alert_status(storage, all_metric_alerts)
+        alert_enabled = resource_alert_status(storage, resource_alert_rules)
         storage_rows.append([storage.get("name", ""), s.get("display_name", ""), alert_enabled])
 if storage_rows:
     add_table(["Storage Account", "Subscription", "Alert Enabled"], storage_rows)
     add_caption("Table 24: Storage Monitoring")
-storage_coverage = monitoring_coverage("Storage Accounts", [storage for s in subs for storage in (s.get("inventory", {}).get("storage_accounts", []) or [])], all_metric_alerts, [])
-add_para(f"Total Storage Accounts: {storage_coverage['totalResources']}; Storage Accounts With Alerts / Activity Metrics: {storage_coverage['resourcesWithAlerts']}. Coverage: {storage_coverage['alertCoveragePct']}%.")
+storage_coverage = monitoring_coverage("Storage Accounts", [storage for s in subs for storage in (s.get("inventory", {}).get("storage_accounts", []) or [])], resource_alert_rules, [])
+add_para(f"Total Storage Accounts: {storage_coverage['totalResources']}; Storage Accounts With applicable alert rules: {storage_coverage['resourcesWithAlerts']}. Coverage: {storage_coverage['alertCoveragePct']}%.")
 
 add_heading("10.5 Azure Networks Monitoring", 2)
 network_resource_sets = [
@@ -2678,13 +2777,13 @@ for label, key in network_resource_sets:
     rows=[]
     for s in subs:
         for resource in s.get("inventory", {}).get(key, []) or []:
-            alert_enabled = resource_alert_status(resource, all_metric_alerts)
+            alert_enabled = resource_alert_status(resource, resource_alert_rules)
             rows.append([resource.get("name", ""), s.get("display_name", ""), alert_enabled])
     if rows:
         add_table(["Resource Name", "Subscription", "Alert Enabled"], rows)
         add_caption(f"Table 25: {label} Monitoring")
-    network_coverage = monitoring_coverage(label, [resource for s in subs for resource in (s.get("inventory", {}).get(key, []) or [])], all_metric_alerts, [])
-    add_para(f"{label} coverage: {network_coverage['totalResources']} total; {network_coverage['resourcesWithAlerts']} with alerts / activity metrics.")
+    network_coverage = monitoring_coverage(label, [resource for s in subs for resource in (s.get("inventory", {}).get(key, []) or [])], resource_alert_rules, [])
+    add_para(f"{label} coverage: {network_coverage['totalResources']} total; {network_coverage['resourcesWithAlerts']} with applicable alert rules.")
 
 add_heading("10.6 Load Balancers / Ingress Monitoring", 2)
 load_balancer_tables = [
@@ -2695,15 +2794,67 @@ for label, key in load_balancer_tables:
     rows=[]
     for s in subs:
         for resource in s.get("inventory", {}).get(key, []) or []:
-            alert_enabled = resource_alert_status(resource, all_metric_alerts)
+            alert_enabled = resource_alert_status(resource, resource_alert_rules)
             rows.append([resource.get("name", ""), s.get("display_name", ""), alert_enabled])
     if rows:
         add_table(["Resource Name", "Subscription", "Alert Enabled"], rows)
         add_caption(f"Table 26: {label} Monitoring")
-    load_coverage = monitoring_coverage(label, [resource for s in subs for resource in (s.get("inventory", {}).get(key, []) or [])], all_metric_alerts, [])
-    add_para(f"{label} coverage: {load_coverage['totalResources']} total; {load_coverage['resourcesWithAlerts']} with alerts / activity metrics.")
+    load_coverage = monitoring_coverage(label, [resource for s in subs for resource in (s.get("inventory", {}).get(key, []) or [])], resource_alert_rules, [])
+    add_para(f"{label} coverage: {load_coverage['totalResources']} total; {load_coverage['resourcesWithAlerts']} with applicable alert rules.")
 
-add_heading("10.7 Logs In Azure Monitoring", 2)
+add_heading("10.7 Additional Resource Monitoring", 2)
+add_para(
+    "The following tables show applicable alert rules for other discovered Azure "
+    "resources. A rule is listed only when it is directly scoped to the resource, "
+    "or explicitly targets that resource type at subscription or resource-group scope."
+)
+additional_monitoring_resources = [
+    ("Resource Groups", "resource_groups"),
+    ("Managed Disks", "disks"),
+    ("Key Vaults", "key_vaults"),
+    ("App Services", "app_services"),
+    ("Function Apps", "function_apps"),
+    ("App Service Plans", "app_service_plans"),
+    ("Container Apps", "container_apps"),
+    ("Container App Environments", "container_app_environments"),
+    ("Container Registries", "container_registries"),
+    ("SQL Servers", "sql_servers"),
+    ("PostgreSQL Servers", "postgres_servers"),
+    ("Cosmos DB Accounts", "cosmos_accounts"),
+    ("Data Factories", "data_factories"),
+    ("Service Bus Namespaces", "service_bus"),
+    ("Event Hubs Namespaces", "event_hubs"),
+    ("Logic Apps", "logic_apps"),
+    ("Event Grid Topics", "eventgrid_topics"),
+    ("Route Tables", "route_tables"),
+    ("Public IP Addresses", "public_ips"),
+    ("Private Endpoints", "private_endpoints"),
+    ("Private DNS Zones", "private_dns_zones"),
+    ("Bastion Hosts", "bastions"),
+    ("Network Interfaces", "network_interfaces"),
+    ("Network Watchers", "network_watchers"),
+    ("Firewall Policies", "firewall_policies"),
+    ("Log Analytics Workspaces", "log_analytics"),
+    ("Application Insights", "application_insights"),
+    ("Recovery Services Vaults", "recovery_vaults"),
+    ("AI Services", "ai_resources"),
+]
+for alert_index, (label, key) in enumerate(additional_monitoring_resources, 1):
+    rows = []
+    for s in subs:
+        for resource in s.get("inventory", {}).get(key, []) or []:
+            rows.append([
+                resource.get("name", ""),
+                resource.get("resourceGroup", resource.get("resource_group", "")),
+                s.get("display_name", ""),
+                resource_alert_status(resource, resource_alert_rules),
+            ])
+    if rows:
+        add_heading(f"10.7.{alert_index} {label}", 3)
+        add_table(["Resource Name", "Resource Group", "Subscription", "Alert Rules"], rows)
+        add_caption(f"Monitoring Alert Rules: {label}")
+
+add_heading("10.8 Logs In Azure Monitoring", 2)
 log_rows=[]
 for s in subs:
     for workspace in s.get("inventory", {}).get("log_analytics", []) or []:
@@ -2730,7 +2881,11 @@ add_para(f"Total Workspaces: {sum(len(s.get('inventory', {}).get('log_analytics'
 add_heading("Monitoring Alert Inventory", 2)
 alert_rows=[]
 for s in subs:
-    for alert in (s.get("inventory", {}).get("metric_alerts", []) or []) + (s.get("inventory", {}).get("activity_log_alerts", []) or []):
+    for alert in (
+        (s.get("inventory", {}).get("metric_alerts", []) or [])
+        + (s.get("inventory", {}).get("activity_log_alerts", []) or [])
+        + (s.get("inventory", {}).get("scheduled_query_alerts", []) or [])
+    ):
         props = alert.get("properties") or {}
         scopes = alert_scopes(alert)
         monitored = ", ".join([resource_name_from_id(scope) or scope for scope in scopes]) if scopes else (props.get("targetResourceType") or alert.get("targetResourceType") or "")
