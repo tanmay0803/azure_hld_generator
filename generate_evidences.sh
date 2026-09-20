@@ -338,6 +338,30 @@ Resources
     )
 
 
+def arg_logic_apps_for_sub(sid):
+
+    return arg_query(
+        sid,
+        r"""
+Resources
+| where type =~ 'microsoft.logic/workflows'
+    or (
+        type =~ 'microsoft.web/sites'
+        and tostring(kind) contains 'workflowapp'
+    )
+| project
+    id,
+    name,
+    resourceGroup,
+    location,
+    type,
+    kind,
+    properties
+"""
+    )
+
+
+
 def arg_dcrs_for_sub(sid):
 
     return arg_query(
@@ -698,22 +722,7 @@ for idx, s in enumerate(subs, 1):
         ["monitor","activity-log","alert","list"],
         []
     )
-    for a in activity_log_alerts:
-
-        print(
-            "\nALERT:",
-            a.get("name")
-        )
-
-        print(
-            "SCOPES:",
-            alert_scopes(a)
-        )
-
-        print(
-            "TARGET TYPES:",
-            alert_target_resource_types(a)
-        )
+   
 
     metric_alerts = az_for_sub(
         sid,
@@ -746,11 +755,74 @@ for idx, s in enumerate(subs, 1):
         ["monitor","workbook","list"],
         []
     )
-    logic_apps = az_for_sub(
+        #
+    # Consumption Logic Apps
+    #
+    logic_apps = arg_logic_apps_for_sub(sid)
+
+#
+# Normalize state for both Consumption and Standard
+#
+    for app in logic_apps:
+
+        props = app.get("properties") or {}
+
+        app["state"] = (
+            props.get("state")
+            or props.get("workflowState")
+            or app.get("state")
+            or app.get("provisioningState")
+            or ""
+        )
+
+
+    
+
+    #
+    # Standard Logic Apps
+    #
+    all_resources = az_for_sub(
         sid,
-        ["logic","workflow","list"],
+        ["resource", "list"],
         []
     )
+
+    logic_app_standard = [
+        r
+        for r in all_resources
+        if (
+            str(r.get("type", "")).lower()
+            == "microsoft.web/sites"
+            and "workflowapp" in str(r.get("kind", "")).lower()
+        )
+    ]
+
+    #
+    # Normalize Standard Logic Apps
+    #
+    for app in logic_app_standard:
+
+        app["state"] = app.get(
+            "state",
+            "Running"
+        )
+
+    logic_apps.extend(
+        logic_app_standard
+    )
+
+    #
+    # Remove duplicates
+    #
+    seen = set()
+
+    logic_apps = [
+        x for x in logic_apps
+        if not (
+            x.get("id") in seen
+            or seen.add(x.get("id"))
+        )
+    ]
     eventgrid_topics = az_for_sub(
         sid,
         ["eventgrid","topic","list"],
@@ -1258,7 +1330,26 @@ def alert_target_resource_types(alert):
                     # the target resource type.
                     if len(parts) >= 3 and parts[-1].lower() in {"read", "write", "delete", "action"}:
                         target_types.append("/".join(parts[:-1]))
-    return {str(item).lower() for item in target_types if item}
+    normalized = set()
+
+    for item in target_types:
+
+        if not item:
+            continue
+
+        value = str(item).lower()
+
+        normalized.add(value)
+
+        #
+        # Resource Group normalization
+        #
+        if value == "microsoft.resources/subscriptions/resourcegroups":
+            normalized.add(
+                "microsoft.resources/resourcegroups"
+            )
+
+    return normalized
 
 def alert_targets_resource(alert, resource):
     """
@@ -2073,13 +2164,20 @@ RESOURCE_CATALOG = {
 
             "title": "5.8 Logic Apps",
 
-            "description": "Logic Apps implement workflow automation and are reported with their resource group, location and current state.",
+            "description": (
+                "Logic Apps provide workflow automation and integration services. "
+                "The inventory includes both Consumption and Standard Logic Apps "
+                "discovered across subscriptions, together with their resource group, "
+                "subscription, deployment model, region and operational state."
+                ),
 
             "headers": [
 
                 "Name",
                 "Resource Group",
+                "Subscription",
                 "Location",
+                "Deployment Model",
                 "State"
 
             ],
@@ -2090,11 +2188,21 @@ RESOURCE_CATALOG = {
 
                 r.get("resourceGroup",""),
 
+                s.get("display_name",""),
+
                 r.get("location",""),
 
-                r.get("state","")
+                (
+                    "Standard"
+                    if "workflowapp"
+                    in str(r.get("kind","")).lower()
+                    else "Consumption"
+                ),
 
-            ]
+                r.get("state",r.get(provisioningState),"")
+
+            ],
+            
 
         },
 
