@@ -698,6 +698,22 @@ for idx, s in enumerate(subs, 1):
         ["monitor","activity-log","alert","list"],
         []
     )
+    for a in activity_log_alerts:
+
+        print(
+            "\nALERT:",
+            a.get("name")
+        )
+
+        print(
+            "SCOPES:",
+            alert_scopes(a)
+        )
+
+        print(
+            "TARGET TYPES:",
+            alert_target_resource_types(a)
+        )
 
     metric_alerts = az_for_sub(
         sid,
@@ -1224,7 +1240,7 @@ def alert_target_resource_types(alert):
         target_types = [target_types]
 
     # Activity Log Alerts store their resource-type filter in condition.allOf.
-    condition = properties.get("condition") or {}
+    condition = (properties.get("condition") or alert.get("condition")  or {} )
     if isinstance(condition, dict):
         for item in condition.get("allOf", []) or []:
             if not isinstance(item, dict):
@@ -1260,6 +1276,173 @@ def alert_targets_resource(alert, resource):
     """
 
     resource_id = str(
+        resource.get("id")
+        or resource.get("resourceId")
+        or ""
+    ).strip()
+
+    if not resource_id:
+        return False
+
+    resource_id_lower = resource_id.lower()
+
+    #
+    # Azure resource type
+    #
+    resource_type = str(
+        resource.get("type")
+        or ""
+    ).strip().lower()
+
+    #
+    # Resource Group
+    #
+    resource_rg = str(
+        resource.get("resourceGroup")
+        or resource.get("resource_group")
+        or rg_from_id(resource_id)
+    ).strip().lower()
+
+    #
+    # Subscription ID
+    #
+    subscription_id = ""
+
+    try:
+        id_parts = resource_id_lower.split("/")
+        subscription_index = id_parts.index("subscriptions")
+        subscription_id = id_parts[subscription_index + 1]
+    except (ValueError, IndexError):
+        pass
+
+    scopes = alert_scopes(alert)
+
+    # ================================================================
+    # 1. DIRECT RESOURCE SCOPE
+    # ================================================================
+
+    for scope in scopes:
+
+        scope = str(scope or "").strip().lower().rstrip("/")
+
+        if not scope:
+            continue
+
+        if scope == resource_id_lower.rstrip("/"):
+            return True
+
+    # ================================================================
+    # 2. TARGET RESOURCE TYPES
+    # ================================================================
+
+    target_types = alert_target_resource_types(alert)
+
+    target_types = {
+        str(item).strip().lower().rstrip("/")
+        for item in target_types
+        if str(item).strip()
+    }
+
+    #
+    # Resource must have a type
+    #
+    if not resource_type:
+        return False
+
+    #
+    # If target types exist,
+    # ensure the resource type matches.
+    #
+    if target_types:
+
+        type_matches = any(
+            resource_type == t
+            or resource_type.startswith(t + "/")
+            or t.startswith(resource_type + "/")
+            for t in target_types
+        )
+
+        if not type_matches:
+            return False
+
+    # ================================================================
+    # 3. RESOURCE GROUP SCOPED ALERT
+    # ================================================================
+
+    if resource_rg and subscription_id:
+
+        expected_rg_scope = (
+            f"/subscriptions/{subscription_id}/resourcegroups/{resource_rg}"
+        )
+
+        for scope in scopes:
+
+            scope = str(scope or "").strip().lower().rstrip("/")
+
+            if scope != expected_rg_scope:
+                continue
+
+            #
+            # No resource type found.
+            # Skip instead of applying to everything.
+            #
+            if not target_types:
+                continue
+
+            #
+            # Resource type already validated above.
+            #
+            return True
+
+    # ================================================================
+    # 4. SUBSCRIPTION SCOPED ALERT
+    # ================================================================
+
+    if subscription_id:
+
+        expected_subscription_scope = (
+            f"/subscriptions/{subscription_id}"
+        )
+
+        for scope in scopes:
+
+            scope = str(scope or "").strip().lower().rstrip("/")
+
+            if scope != expected_subscription_scope:
+                continue
+
+            #
+            # No resource type extracted.
+            # Do NOT match every resource.
+            #
+            if not target_types:
+                continue
+
+            #
+            # Resource type already validated above.
+            #
+            return True
+
+    # ================================================================
+    # 5. FALLBACK
+    # ================================================================
+
+    return False
+    """
+    Determine whether an alert applies to the Azure resource.
+
+    Supports:
+      1. Direct resource-level alert scope
+      2. Resource-group scoped alerts targeting the resource type
+      3. Subscription scoped alerts targeting the resource type
+
+    Applies to:
+      - Metric Alerts
+      - Activity Log Alerts
+      - Log Query / Scheduled Query Alerts
+    """
+
+    resource_id = str(
         resource.get("id") or resource.get("resourceId") or ""
     ).strip()
 
@@ -1279,7 +1462,7 @@ def alert_targets_resource(alert, resource):
     resource_rg = str(
         resource.get("resourceGroup")
         or resource.get("resource_group")
-        or ""
+        or rg_from_id(resource_id)
     ).strip().lower()
 
     # Subscription ID from resource ID
@@ -1335,12 +1518,11 @@ def alert_targets_resource(alert, resource):
         return False
 
     # Exact or compatible Azure resource type match
-    type_matches = (
-        resource_type in target_types
-        or any(
-            resource_type.endswith("/" + target_type)
-            for target_type in target_types
-        )
+    type_matches = any(
+    resource_type == t
+    or resource_type.startswith(t + "/")
+    or t.startswith(resource_type + "/")
+    for t in target_types
     )
 
     if not type_matches:
@@ -1363,6 +1545,7 @@ def alert_targets_resource(alert, resource):
     # then it applies to this resource.
     #
     if resource_rg:
+
         expected_rg_scope = (
             f"/subscriptions/{subscription_id}/resourcegroups/{resource_rg}"
             if subscription_id
@@ -1370,10 +1553,31 @@ def alert_targets_resource(alert, resource):
         )
 
         for scope in scopes:
+
             scope = str(scope or "").strip().lower().rstrip("/")
 
-            if expected_rg_scope and scope == expected_rg_scope:
-                return True
+            if scope != expected_rg_scope:
+                continue
+
+        #
+        # Alert scoped at RG level and
+        # applies to all resources in RG
+        #
+        if not target_types:
+            return True
+
+        #
+        # Type-specific RG alert
+        #
+        if (
+            resource_type in target_types
+            or any(
+                resource_type.startswith(t + "/")
+                for t in target_types
+            )
+        ):
+            return True
+    return False
 
     # ================================================================
     # 4. SUBSCRIPTION SCOPED ALERT
@@ -1391,14 +1595,35 @@ def alert_targets_resource(alert, resource):
     # Microsoft.App/managedEnvironments/cae-01
     #
     if subscription_id:
+
         expected_subscription_scope = (
             f"/subscriptions/{subscription_id}"
         )
 
         for scope in scopes:
+
             scope = str(scope or "").strip().lower().rstrip("/")
 
-            if scope == expected_subscription_scope:
+            if scope != expected_subscription_scope:
+                continue
+
+            #
+            # Metric alert directly at subscription level
+            #
+            if not target_types:
+                return True
+
+            #
+            # Activity Log Alert / Log Alert
+            # matching resource type
+            #
+            if (
+                resource_type in target_types
+                or any(
+                    resource_type.startswith(t + "/")
+                    for t in target_types
+                )
+            ):
                 return True
 
     return False
@@ -3134,6 +3359,5 @@ echo "Output: $OUTPUT"
 echo "Subscriptions discovered: $(python3 -c 'import json; print(len(json.load(open("'"$INVENTORY"'"))["subscriptions"]))')"
 echo "=============================================================="
 echo "Open the DOCX in Microsoft Word and allow the Table of Contents to update."
-
 
 
