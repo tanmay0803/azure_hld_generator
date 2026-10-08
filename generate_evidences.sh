@@ -32,14 +32,21 @@
 #   MG_STRUCTURE_IMAGE="./management_group_structure.png" for portal screenshot evidence
 #   FOUNDRY_PROJECT_ENDPOINT, FOUNDRY_AGENT_NAME, FOUNDRY_AGENT_VERSION
 #   FOUNDRY_MAX_INPUT_CHARS=9000 to set the serialized evidence batch size
+#   FOUNDRY_TRACING_ENABLED=0 to disable OpenTelemetry traces (enabled by default)
+#   FOUNDRY_OTEL_ENDPOINT=http://localhost:4318 for the OTLP HTTP collector
 #   MODEL_ENRICHMENT_ENABLED=0 to skip Foundry agent design-note enrichment
 #   AGENT_ENRICHMENT_ENABLED remains accepted as a legacy setting
 #   The script automatically loads ENV_FILE (default: ./.env) when present.
+#   Optional Agent tracing packages:
+#   opentelemetry-instrumentation-openai-v2==2.1b0
+#   opentelemetry-sdk==1.34.1
+#   opentelemetry-exporter-otlp-proto-http==1.34.1
 #
 # Notes:
 #   - Read-only discovery only. No Azure resources are changed.
 #   - Foundry agent authentication uses DefaultAzureCredential.
-#   - The agent also writes one evidence-grounded summary for each inventoried resource.
+#   - The agent classifies selected Azure architecture evidence; failures do not
+#     prevent deterministic HLD generation.
 #   - The generated document reports what Azure exposes to the current identity.
 #   - Resources for which the caller lacks read permission are recorded as
 #     "Not accessible" rather than invented.
@@ -88,10 +95,10 @@ fi
 
 if [[ "$MODEL_ENRICHMENT_ENABLED" != "0" ]] &&
    ! python3 -c "from azure.ai.projects import AIProjectClient; from azure.identity import DefaultAzureCredential; from openai import RateLimitError" >/dev/null 2>&1; then
-  echo "ERROR: Foundry agent enrichment requires azure-ai-projects, azure-identity, and openai."
+  echo "[AI] SKIPPED: Foundry Agent dependencies are unavailable; continuing without AI analysis."
   echo 'Install them with: python3 -m pip install "azure-ai-projects>=2.1.0" azure-identity openai'
-  echo "Or set MODEL_ENRICHMENT_ENABLED=0 to skip Foundry agent enrichment."
-  exit 1
+  MODEL_ENRICHMENT_ENABLED=0
+  export MODEL_ENRICHMENT_ENABLED
 fi
 
 if [[ ! -f "$TEMPLATE" ]]; then
@@ -1137,7 +1144,7 @@ print(f"Discovered {len(subs)} subscription(s).", file=sys.stderr)
 PY
 fi
 
-echo "Generating Word HLD..."
+echo "[DOCX] Generating HLD..."
 
 echo "Checking python-docx..."
 
@@ -1166,6 +1173,23 @@ from docx.oxml.ns import qn
 template = Path(os.environ["TEMPLATE"])
 output = Path(os.environ["OUTPUT"])
 data = json.loads(Path(os.environ["INVENTORY"]).read_text())
+SENSITIVE_KEY_PATTERN = re.compile(
+    r"(?:password|secret|token|credential|private.?key|license.?key|"
+    r"snmp.?community|registration.?key|api.?key|access.?key|"
+    r"connection.?string|shared.?access.?signature)",
+    re.IGNORECASE,
+)
+
+
+def safe_tag_text(tags):
+    return "; ".join(
+        f"{key}={safe_tag_value(key, value)}"
+        for key, value in sorted((tags or {}).items())
+    )
+
+
+def safe_tag_value(key, value):
+    return "[REDACTED]" if SENSITIVE_KEY_PATTERN.search(str(key)) else value
 
 
 def classify_vm_vendor(name, image, plan, tags):
@@ -1284,32 +1308,63 @@ if os.environ.get("REUSE_INVENTORY", "0") != "1":
 
 
 def invoke_network_design_agent(subscriptions):
+    def ai_log(message):
+        print(f"[AI] {message}", file=sys.stdout, flush=True)
+
+    def safe_error_detail(error):
+        detail = re.sub(r"(?i)\bBearer\s+\S+", "Bearer [redacted]", str(error))
+        detail = re.sub(
+            r"(?i)((?:api[_-]?key|access[_-]?token|password|secret)\s*[=:]\s*)[^\s,;]+",
+            r"\1[redacted]",
+            detail,
+        )
+        detail = re.sub(
+            r"(?i)/subscriptions/[^,\s'\";]+",
+            "[Azure resource ID redacted]",
+            detail,
+        )
+        return detail[:600]
+
     evidence = {"vnets": [], "subnets": [], "apim_services": []}
     resource_evidence = []
-    summary_inventory_types = {
+    context_inventory_types = {
+        "vnets",
+        "subnets",
         "nsgs",
         "route_tables",
         "peerings",
         "public_ips",
+        "network_interfaces",
+        "private_dns_zones",
+        "network_watchers",
+        "bastions",
+    }
+    architecture_inventory_types = {
         "vms",
         "application_gateways",
         "firewalls",
         "firewall_policies",
         "frontdoor_profiles",
         "load_balancers",
-        "bastions",
-        "network_interfaces",
         "private_endpoints",
-        "private_dns_zones",
-        "network_watchers",
         "aks_clusters",
         "aro_clusters",
         "vm_scale_sets",
+        "apim_services",
         "sql_servers",
         "postgres_servers",
         "cosmos_accounts",
         "ai_resources",
+        "app_services",
+        "function_apps",
+        "container_apps",
+        "container_registries",
+        "service_bus",
+        "event_hubs",
+        "storage_accounts",
+        "key_vaults",
     }
+    context_by_id = {}
     platform_detail_fields = {
         "aks_clusters": {
             "provisioningState": None,
@@ -1360,6 +1415,72 @@ def invoke_network_design_agent(subscriptions):
             },
         },
     }
+    resource_detail_fields = {
+        "network_interfaces": {
+            "enableIPForwarding": None,
+            "enableAcceleratedNetworking": None,
+            "ipConfigurations": None,
+            "networkSecurityGroup": None,
+        },
+        "nsgs": {
+            "securityRules": None,
+            "defaultSecurityRules": None,
+        },
+        "route_tables": {
+            "disableBgpRoutePropagation": None,
+            "routes": None,
+        },
+        "load_balancers": {
+            "frontendIPConfigurations": None,
+            "backendAddressPools": None,
+            "probes": None,
+            "loadBalancingRules": None,
+        },
+        "application_gateways": {
+            "sku": None,
+            "gatewayIPConfigurations": None,
+            "frontendIPConfigurations": None,
+            "backendAddressPools": None,
+            "backendHttpSettingsCollection": None,
+            "requestRoutingRules": None,
+            "probes": None,
+            "enableHttp2": None,
+            "firewallPolicy": None,
+            "webApplicationFirewallConfiguration": None,
+        },
+        "firewalls": {
+            "sku": None,
+            "threatIntelMode": None,
+            "ipConfigurations": None,
+            "firewallPolicy": None,
+            "virtualHub": None,
+        },
+        "firewall_policies": {
+            "threatIntelMode": None,
+            "intrusionDetection": None,
+            "ruleCollectionGroups": None,
+        },
+        "private_endpoints": {
+            "subnet": None,
+            "privateLinkServiceConnections": None,
+            "manualPrivateLinkServiceConnections": None,
+            "customDnsConfigs": None,
+        },
+        "vnets": {
+            "addressSpace": None,
+            "subnets": None,
+            "virtualNetworkPeerings": None,
+        },
+        "subnets": {
+            "addressPrefix": None,
+            "addressPrefixes": None,
+            "networkSecurityGroup": None,
+            "routeTable": None,
+            "delegations": None,
+            "privateEndpointNetworkPolicies": None,
+            "privateLinkServiceNetworkPolicies": None,
+        },
+    }
     summary_fields = (
         "sku",
         "kind",
@@ -1374,6 +1495,8 @@ def invoke_network_design_agent(subscriptions):
         "image",
         "marketplace_plan",
         "vendor_detection",
+        "network_interfaces",
+        "public_access",
         "gatewayUrl",
         "developerPortalUrl",
         "capacity",
@@ -1399,7 +1522,29 @@ def invoke_network_design_agent(subscriptions):
         "tier",
         "enableSoftDelete",
         "enablePurgeProtection",
+        "identity",
     )
+
+    sensitive_key_pattern = re.compile(
+        r"(?:password|secret|token|credential|private.?key|license.?key|"
+        r"snmp.?community|registration.?key|api.?key|access.?key|"
+        r"connection.?string|shared.?access.?signature)",
+        re.IGNORECASE,
+    )
+
+    def redact_sensitive_data(value):
+        if isinstance(value, dict):
+            return {
+                str(key): (
+                    "[REDACTED]"
+                    if sensitive_key_pattern.search(str(key))
+                    else redact_sensitive_data(item)
+                )
+                for key, item in value.items()
+            }
+        if isinstance(value, list):
+            return [redact_sensitive_data(item) for item in value]
+        return value
 
     def compact_value(value, depth=0, max_depth=2):
         if isinstance(value, str):
@@ -1449,16 +1594,18 @@ def invoke_network_design_agent(subscriptions):
         subscription_id = subscription.get("subscription_id", subscription_name)
         for resource_type, resources in inventory.items():
             if (
-                resource_type not in summary_inventory_types
-                or not isinstance(resources, list)
-            ):
+                resource_type not in architecture_inventory_types
+                and resource_type not in context_inventory_types
+            ) or not isinstance(resources, list):
                 continue
             for index, resource in enumerate(resources):
                 if not isinstance(resource, dict):
                     continue
-                resource_id = f"{subscription_id}:{resource_type}:{index}"
+                evidence_id = f"{subscription_id}:{resource_type}:{index}"
+                azure_resource_id = resource.get("id", "")
                 facts = {
-                    "evidence_id": resource_id,
+                    "evidence_id": evidence_id,
+                    "resource_id": azure_resource_id,
                     "resource_type": resource_type.replace("_", " ").title(),
                     "subscription": subscription_name,
                     "name": resource.get("name", ""),
@@ -1470,10 +1617,20 @@ def invoke_network_design_agent(subscriptions):
                 }
                 for field in summary_fields:
                     if resource.get(field) not in (None, "", [], {}):
-                        facts[field] = compact_value(resource[field])
+                        facts[field] = compact_value(
+                            resource[field],
+                            max_depth=4 if field in (
+                                "network_interfaces",
+                                "vendor_detection",
+                                "marketplace_plan",
+                            ) else 2,
+                        )
                 properties = resource.get("properties")
                 if isinstance(properties, dict):
-                    detailed_fields = platform_detail_fields.get(resource_type)
+                    detailed_fields = (
+                        platform_detail_fields.get(resource_type)
+                        or resource_detail_fields.get(resource_type)
+                    )
                     safe_properties = (
                         project_platform_properties(properties, detailed_fields)
                         if detailed_fields
@@ -1497,11 +1654,21 @@ def invoke_network_design_agent(subscriptions):
                     identity = resource.get("identity")
                     if isinstance(identity, dict) and identity.get("type"):
                         facts["identity_type"] = identity["type"]
-                resource_evidence.append(facts)
+                facts = redact_sensitive_data(facts)
+                facts["inventory_key"] = resource_type
+                if (
+                    resource_type in context_inventory_types
+                    and isinstance(azure_resource_id, str)
+                    and azure_resource_id
+                ):
+                    context_by_id[azure_resource_id.lower()] = facts
+                else:
+                    resource_evidence.append(facts)
 
         for vnet in inventory.get("vnets", []) or []:
             evidence["vnets"].append({
                 "subscription": subscription_name,
+                "resource_id": vnet.get("id", ""),
                 "name": vnet.get("name", ""),
                 "resource_group": vnet.get("resourceGroup", ""),
                 "location": vnet.get("location", ""),
@@ -1512,18 +1679,26 @@ def invoke_network_design_agent(subscriptions):
                     subnet.get("name", "")
                     for subnet in vnet.get("subnets", []) or []
                 ],
+                "subnet_ids": [
+                    subnet.get("id", "")
+                    for subnet in vnet.get("subnets", []) or []
+                    if subnet.get("id")
+                ],
                 "tags": vnet.get("tags") or {},
             })
         for subnet in inventory.get("subnets", []) or []:
             evidence["subnets"].append({
                 "subscription": subscription_name,
+                "resource_id": subnet.get("id", ""),
                 "vnet": subnet.get("vnet", ""),
                 "name": subnet.get("name", ""),
                 "resource_group": subnet.get("resource_group", ""),
                 "location": subnet.get("location", ""),
                 "address_prefixes": subnet.get("address_prefixes") or [],
                 "nsg": resource_name_from_id(subnet.get("nsg_id", "")),
+                "nsg_id": subnet.get("nsg_id", ""),
                 "route_table": resource_name_from_id(subnet.get("route_table_id", "")),
+                "route_table_id": subnet.get("route_table_id", ""),
                 "delegations": subnet.get("delegations") or [],
                 "private_endpoint_network_policies": subnet.get(
                     "private_endpoint_network_policies"
@@ -1556,7 +1731,83 @@ def invoke_network_design_agent(subscriptions):
                 "tags": apim.get("tags") or {},
             })
 
+    evidence = redact_sensitive_data(evidence)
+    resource_evidence = [
+        resource
+        for resource in resource_evidence
+        if isinstance(resource.get("resource_id"), str)
+        and re.match(
+            r"^/subscriptions/[^/]+/(?:resourceGroups/[^/]+/)?providers/[^/]+/.+",
+            resource["resource_id"],
+            re.IGNORECASE,
+        )
+    ]
+    known_resource_ids = {}
+    for subscription in subscriptions:
+        for resources in (subscription.get("inventory") or {}).values():
+            if not isinstance(resources, list):
+                continue
+            for resource in resources:
+                if isinstance(resource, dict) and isinstance(resource.get("id"), str):
+                    resource_id = resource["id"].strip()
+                    if resource_id:
+                        known_resource_ids[resource_id.lower()] = resource_id
+    def find_known_resource_ids(value):
+        found = set()
+        if isinstance(value, dict):
+            for item in value.values():
+                found.update(find_known_resource_ids(item))
+        elif isinstance(value, list):
+            for item in value:
+                found.update(find_known_resource_ids(item))
+        elif isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in known_resource_ids:
+                found.add(normalized)
+            else:
+                parent_id = normalized.rstrip("/")
+                while "/" in parent_id:
+                    parent_id = parent_id.rsplit("/", 1)[0]
+                    if parent_id in known_resource_ids:
+                        found.add(parent_id)
+                        break
+        return found
+
+    for resource in resource_evidence:
+        related_subnets = [
+            subnet
+            for subnet in evidence["subnets"]
+            if str(subnet.get("resource_id") or "").lower()
+            in find_known_resource_ids(resource)
+        ]
+        related_context_ids = set()
+        frontier = [resource, related_subnets]
+        for _ in range(2):
+            linked_ids = set()
+            for item in frontier:
+                linked_ids.update(find_known_resource_ids(item))
+            linked_ids.difference_update(
+                {resource.get("resource_id", "").lower()}
+            )
+            linked_context_ids = linked_ids.intersection(context_by_id)
+            new_context_ids = linked_context_ids - related_context_ids
+            if not new_context_ids:
+                break
+            related_context_ids.update(new_context_ids)
+            frontier = [
+                context_by_id[resource_id]
+                for resource_id in new_context_ids
+            ]
+        resource["related_subnets"] = related_subnets
+        resource["related_resources"] = [
+            context_by_id[resource_id]
+            for resource_id in sorted(related_context_ids)
+        ]
     if not any(evidence.values()) and not resource_evidence:
+        ai_log(
+            "SKIPPED: no VNet, subnet, APIM, or selected architecture-resource "
+            "evidence was available for this inventory."
+        )
         return {}
 
     try:
@@ -1589,6 +1840,66 @@ def invoke_network_design_agent(subscriptions):
     if max_input_chars < 1000:
         raise ValueError("FOUNDRY_MAX_INPUT_CHARS must be at least 1000.")
 
+    tracer = None
+    tracer_provider = None
+    if os.environ.get("FOUNDRY_TRACING_ENABLED", "1") != "0":
+        try:
+            from opentelemetry import trace
+            from opentelemetry.exporter.otlp.proto.http.trace_exporter import (
+                OTLPSpanExporter,
+            )
+            from opentelemetry.instrumentation.openai_v2 import OpenAIInstrumentor
+            from opentelemetry.sdk.resources import Resource
+            from opentelemetry.sdk.trace import TracerProvider
+            from opentelemetry.sdk.trace.export import BatchSpanProcessor
+            from opentelemetry.trace import Status, StatusCode
+        except ImportError as error:
+            ai_log(
+                "TRACING UNAVAILABLE: OpenTelemetry tracing packages are not "
+                "installed; the Agent request will still run. Install them with: "
+                'python3 -m pip install "opentelemetry-instrumentation-openai-v2==2.1b0" '
+                '"opentelemetry-sdk==1.34.1" '
+                '"opentelemetry-exporter-otlp-proto-http==1.34.1"'
+            )
+        else:
+            otlp_endpoint = os.environ.get(
+                "FOUNDRY_OTEL_ENDPOINT",
+                os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4318"),
+            ).rstrip("/")
+            trace_endpoint = os.environ.get(
+                "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+                f"{otlp_endpoint}/v1/traces",
+            )
+            os.environ.setdefault(
+                "OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT", "false"
+            )
+            try:
+                tracer_provider = TracerProvider(
+                    resource=Resource.create(
+                        {"service.name": "azure-hld-generator"}
+                    )
+                )
+                tracer_provider.add_span_processor(
+                    BatchSpanProcessor(OTLPSpanExporter(endpoint=trace_endpoint))
+                )
+                trace.set_tracer_provider(tracer_provider)
+                OpenAIInstrumentor().instrument()
+                tracer = trace.get_tracer("azure_hld_generator.foundry_agent")
+                ai_log(
+                    "TRACING ENABLED: OpenAI SDK instrumentation exports spans "
+                    "to the configured OTLP HTTP collector; prompt/response "
+                    "content capture is disabled."
+                )
+            except Exception as error:
+                if tracer_provider is not None:
+                    tracer_provider.shutdown()
+                tracer_provider = None
+                ai_log(
+                    "TRACING INITIALIZATION FAILED: "
+                    f"{type(error).__name__}: {safe_error_detail(error)}. "
+                    "The Agent request will still run without tracing."
+                )
+
     work_items = []
     for category, entries in (
         ("vnets", evidence["vnets"]),
@@ -1599,7 +1910,7 @@ def invoke_network_design_agent(subscriptions):
             {"kind": category, "data": entry} for entry in entries
         )
     work_items.extend(
-        {"kind": "resource_summary", "data": resource}
+        {"kind": "architecture_resource", "data": resource}
         for resource in resource_evidence
     )
 
@@ -1620,17 +1931,32 @@ def invoke_network_design_agent(subscriptions):
     if current_batch:
         batches.append(current_batch)
 
-    print(
-        "Foundry enrichment scope: VNet/subnet/APIM design plus "
-        f"{len(resource_evidence)} selected network, VM, database, and AI resource(s).",
-        file=sys.stderr,
+    counts_by_kind = {
+        kind: sum(item["kind"] == kind for item in work_items)
+        for kind in ("vnets", "subnets", "apim_services", "architecture_resource")
+    }
+    ai_log(
+        "ENABLED: "
+        f"agent={agent_name}@{agent_version}; "
+        f"evidence_items={len(work_items)} "
+        f"(vnets={counts_by_kind['vnets']}, subnets={counts_by_kind['subnets']}, "
+        f"apim={counts_by_kind['apim_services']}, "
+        f"architecture_resources={counts_by_kind['architecture_resource']}); "
+        f"max_batch_chars={max_input_chars}; batches={len(batches)}."
     )
     credential = DefaultAzureCredential()
-    project_client = AIProjectClient(
-        endpoint=project_endpoint,
-        credential=credential,
-    )
-    openai_client = project_client.get_openai_client()
+    project_client = None
+    try:
+        project_client = AIProjectClient(
+            endpoint=project_endpoint,
+            credential=credential,
+        )
+        openai_client = project_client.get_openai_client()
+    except Exception:
+        if project_client is not None:
+            project_client.close()
+        credential.close()
+        raise
 
     def retry_delay_seconds(error, attempt):
         headers = getattr(getattr(error, "response", None), "headers", {}) or {}
@@ -1652,7 +1978,65 @@ def invoke_network_design_agent(subscriptions):
             return max(float(match.group(1)), 0.25)
         return min(2 ** (attempt + 1), 30)
 
-    def request_batch(batch, retry_attempt=0):
+    def create_agent_response(prompt):
+        if tracer is None:
+            return openai_client.responses.create(
+                input=[{"role": "user", "content": prompt}],
+                extra_body={
+                    "agent_reference": {
+                        "name": agent_name,
+                        "version": agent_version,
+                        "type": "agent_reference",
+                    }
+                },
+            )
+
+        with tracer.start_as_current_span(
+            "foundry.agent.responses.create",
+            attributes={
+                "gen_ai.operation.name": "invoke_agent",
+                "gen_ai.agent.name": agent_name,
+                "gen_ai.agent.version": agent_version,
+            },
+        ) as span:
+            try:
+                response = openai_client.responses.create(
+                    input=[{"role": "user", "content": prompt}],
+                    extra_body={
+                        "agent_reference": {
+                            "name": agent_name,
+                            "version": agent_version,
+                            "type": "agent_reference",
+                        }
+                    },
+                )
+            except Exception as error:
+                span.set_attribute("error.type", type(error).__name__)
+                span.set_status(Status(StatusCode.ERROR))
+                raise
+
+            response_id = getattr(response, "id", None)
+            response_status = getattr(response, "status", None)
+            usage = getattr(response, "usage", None)
+            if response_id:
+                span.set_attribute("gen_ai.response.id", str(response_id))
+            if response_status:
+                span.set_attribute("gen_ai.response.status", str(response_status))
+            if usage is not None:
+                for usage_field in (
+                    "input_tokens",
+                    "output_tokens",
+                    "total_tokens",
+                ):
+                    usage_value = getattr(usage, usage_field, None)
+                    if isinstance(usage_value, (int, float)):
+                        span.set_attribute(
+                            f"gen_ai.usage.{usage_field}", usage_value
+                        )
+            span.set_status(Status(StatusCode.OK))
+            return response
+
+    def request_batch(batch, request_label, retry_attempt=0):
         batch_evidence = {
             "network_design": {
                 "vnets": [
@@ -1670,142 +2054,195 @@ def invoke_network_design_agent(subscriptions):
             "resources": [
                 item["data"]
                 for item in batch
-                if item["kind"] == "resource_summary"
+                if item["kind"] == "architecture_resource"
             ],
         }
-        expected_ids = {
-            resource["evidence_id"] for resource in batch_evidence["resources"]
-        }
-        expected_platform_ids = {
-            resource["evidence_id"]
+        expected_resources = {
+            resource["resource_id"].lower(): resource
             for resource in batch_evidence["resources"]
-            if resource.get("platform_detail_type")
         }
         prompt = f"""
-Enrich the High Level Design with evidence-grounded design notes for Azure VNets,
-subnets, API Management (APIM), Azure Kubernetes Service (AKS), Azure Red Hat
-OpenShift (ARO), and Virtual Machine Scale Sets (VMSS).
+Follow the architecture-analysis instructions configured on this Foundry Agent.
+Use only the supplied Azure inventory as observed Azure evidence. Return one
+strict JSON object matching this response contract:
 
-Use the Azure QC Control Library, Naming Standards, Tagging Standards, Policies,
-HLD and LLD available in your knowledge base as reference expectations where
-relevant. Treat the supplied JSON as the complete observed state for this batch.
+{{
+  "vnet_notes": "string",
+  "subnet_notes": "string",
+  "apim_notes": "string",
+  "resource_classifications": [{{
+    "resource_id": "exact supplied Azure resource ID",
+    "resource_name": "string",
+    "azure_resource_type": "string",
+    "vendor": "string",
+    "product": "string",
+    "category": "string",
+    "technology": "string",
+    "probable_role": "string",
+    "environment": "string",
+    "confidence": 0.0,
+    "evidence": [{{
+      "attribute": "string",
+      "value": "string",
+      "source": "azure_inventory",
+      "evidence": "specific supplied fact"
+    }}],
+    "relationships": [{{
+      "relationship": "string",
+      "target_resource": "exact Azure resource ID present in supplied evidence",
+      "purpose": "string"
+    }}],
+    "architecture_observations": ["string"],
+    "recommendations": ["string"],
+    "required_validation": ["string"]
+  }}],
+  "architecture_summary": {{
+    "network_architecture": ["string"],
+    "security_architecture": ["string"],
+    "application_delivery": ["string"],
+    "connectivity": ["string"],
+    "high_availability": ["string"]
+  }},
+  "findings": ["string"]
+}}
 
-Rules:
-- Separate observed facts from recommendations.
-- Do not invent connectivity, routes, NSG rules, private endpoints, APIM modes,
-  security controls, or compliance results not shown in the evidence.
-- Treat a missing field as "not reported / requires validation", not as enabled
-  or disabled.
-- For public access, report the APIM public network access value exactly as given;
-  do not infer actual reachability from a URL or VNet configuration.
-- Write concise, practical HLD notes and call out material missing evidence.
-- Keep each note as plain-text paragraphs suitable for insertion into a Word HLD.
-- Label recommendations and required validations distinctly from observed facts.
-- For every supplied resource with "platform_detail_type", return a detailed
-  evidence-grounded analysis in "platform_analyses". Cover observed version/SKU
-  and provisioning state; topology and network integration; identity and access;
-  security posture; node-pool/scale/upgrade behavior where supplied; monitoring
-  and operational controls; and concrete validation gaps or recommendations.
-  Explicitly distinguish observations from recommendations. Mention "not
-  reported" rather than inferring omitted settings. Do not describe pod,
-  workload, or appliance internals that are not in Azure resource evidence.
-- Write platform analysis as useful HLD detail, normally 3-6 short sentences per
-  resource, and avoid repeating the resource summary verbatim.
-- Return exactly one JSON object with string properties "vnet_notes",
-  "subnet_notes", and "apim_notes", plus "resource_summaries" and
-  "platform_analyses" arrays. Use an
-  empty string for a category with no evidence in this batch. Include exactly
-  one summary object for every supplied selected network, VM, database, or
-  Azure AI resource in this batch's resource evidence,
-  preserving its "evidence_id". Each summary must be one concise,
-  evidence-grounded sentence (maximum 25 words), with no assumptions about
-  unobserved configuration. Do not omit or duplicate resources. Do not include
-  Markdown fences or any text outside the JSON object.
-  Each platform analysis object must contain exactly "evidence_id" and
-  "analysis" string fields, and cover every detailed platform resource in this
-  batch exactly once.
+Return exactly one classification for every item in "resources", and no others.
+Preserve resource IDs, names and Azure resource types exactly as supplied.
+Every claim must cite a supplied fact in "evidence". Distinguish observation,
+inference, interpretation, recommendation and validation. Missing values mean
+"not reported", never "absent", disabled or noncompliant. Do not claim appliance
+internal configuration or in-cluster workload state. Only state relationships
+supported by supplied IDs or explicit associations. Confidence must be numeric
+between 0 and 1. Use empty strings/arrays when the evidence does not support a
+conclusion. The network note string must be empty when its evidence array is
+empty. Do not include Markdown fences or text outside the JSON object.
 
 Design evidence:
 {json.dumps(batch_evidence, ensure_ascii=False)}
 """
+        evidence_counts = {
+            kind: sum(item["kind"] == kind for item in batch)
+            for kind in ("vnets", "subnets", "apim_services", "architecture_resource")
+        }
+        ai_log(
+            f"REQUEST {request_label}: calling Agent with {len(batch)} evidence "
+            f"item(s), prompt_chars={len(prompt)} "
+            f"(vnets={evidence_counts['vnets']}, "
+            f"subnets={evidence_counts['subnets']}, "
+            f"apim={evidence_counts['apim_services']}, "
+            f"resources={evidence_counts['architecture_resource']})."
+        )
+        request_started = time.monotonic()
         try:
-            response = openai_client.responses.create(
-                input=[{"role": "user", "content": prompt}],
-                extra_body={
-                    "agent_reference": {
-                        "name": agent_name,
-                        "version": agent_version,
-                        "type": "agent_reference",
-                    }
-                },
-            )
+            response = create_agent_response(prompt)
         except RateLimitError as error:
             if len(batch) > 1:
                 delay = retry_delay_seconds(error, retry_attempt)
                 print(
-                    "WARNING: Foundry token rate limit hit; splitting a batch "
+                    f"[AI] WARNING: rate limit for request {request_label}; splitting a batch "
                     f"of {len(batch)} evidence items and retrying sequentially "
                     f"after {delay:g}s.",
-                    file=sys.stderr,
+                    file=sys.stdout,
+                    flush=True,
                 )
                 time.sleep(delay)
                 midpoint = len(batch) // 2
-                left = request_batch(batch[:midpoint])
-                right = request_batch(batch[midpoint:])
+                left = request_batch(batch[:midpoint], f"{request_label}a")
+                right = request_batch(batch[midpoint:], f"{request_label}b")
                 combined = {
                     key: "\n\n".join(
                         value for value in (left[key], right[key]) if value
                     )
                     for key in ("vnet_notes", "subnet_notes", "apim_notes")
                 }
-                combined["summary_by_id"] = {
-                    **left["summary_by_id"],
-                    **right["summary_by_id"],
+                combined["classification_by_id"] = {
+                    **left["classification_by_id"],
+                    **right["classification_by_id"],
                 }
-                combined["analysis_by_id"] = {
-                    **left["analysis_by_id"],
-                    **right["analysis_by_id"],
+                combined["architecture_summary"] = {
+                    key: left["architecture_summary"][key]
+                    + right["architecture_summary"][key]
+                    for key in left["architecture_summary"]
                 }
+                combined["findings"] = list(dict.fromkeys(
+                    left["findings"] + right["findings"]
+                ))
                 return combined
             if retry_attempt < 3:
                 delay = retry_delay_seconds(error, retry_attempt)
-                print(
-                    "WARNING: Foundry token rate limit hit for one evidence "
-                    f"item; retrying in {delay:g}s "
-                    f"({retry_attempt + 1}/3).",
-                    file=sys.stderr,
+                ai_log(
+                    f"WARNING: rate limit for single-item request {request_label}; "
+                    f"retrying in {delay:g}s ({retry_attempt + 1}/3)."
                 )
                 time.sleep(delay)
-                return request_batch(batch, retry_attempt + 1)
+                return request_batch(batch, request_label, retry_attempt + 1)
             raise RuntimeError(
                 "Foundry token rate limit persisted for a single evidence item "
-                "after three retries. Retry later or reduce the evidence fields."
+                "after three retries. "
+                "Retry later or reduce the evidence fields."
             ) from error
+        except Exception as error:
+            ai_log(
+                f"REQUEST {request_label} FAILED after "
+                f"{time.monotonic() - request_started:.1f}s: "
+                f"{type(error).__name__}: {safe_error_detail(error)}"
+            )
+            raise
 
         output_text = getattr(response, "output_text", None)
+        usage = getattr(response, "usage", None)
+        usage_summary = ""
+        if usage is not None:
+            usage_parts = [
+                f"{name}={getattr(usage, name)}"
+                for name in ("input_tokens", "output_tokens", "total_tokens")
+                if getattr(usage, name, None) is not None
+            ]
+            if usage_parts:
+                usage_summary = "; " + ", ".join(usage_parts)
+        response_id = getattr(response, "id", None)
+        response_status = getattr(response, "status", None)
+        response_metadata = []
+        if response_id:
+            response_metadata.append(f"id={response_id}")
+        if response_status:
+            response_metadata.append(f"status={response_status}")
+        if usage_summary:
+            response_metadata.append(usage_summary.lstrip("; "))
+        ai_log(
+            f"RESPONSE {request_label}: received after "
+            f"{time.monotonic() - request_started:.1f}s; "
+            f"output_chars={len(output_text) if isinstance(output_text, str) else 0}"
+            f"{'; ' + '; '.join(response_metadata) if response_metadata else ''}."
+        )
         if not isinstance(output_text, str) or not output_text.strip():
-            raise RuntimeError("Foundry model returned no output text.")
+            raise RuntimeError("Foundry Agent returned no output text.")
+        ai_log(f"PARSE {request_label}: decoding Agent JSON output.")
         try:
             notes = json.loads(output_text)
         except json.JSONDecodeError as error:
             raise RuntimeError(
-                "Foundry model response was not valid JSON for the requested design notes."
+                "Foundry Agent response was not valid JSON."
             ) from error
+        ai_log(
+            f"VALIDATE {request_label}: checking response fields, evidence "
+            "citations, resource IDs, and relationship targets."
+        )
         expected_keys = {
             "vnet_notes",
             "subnet_notes",
             "apim_notes",
-            "resource_summaries",
-            "platform_analyses",
+            "resource_classifications",
+            "architecture_summary",
+            "findings",
         }
         if not isinstance(notes, dict) or set(notes) != expected_keys:
             raise RuntimeError(
-                "Foundry model response must contain vnet_notes, subnet_notes, "
-                "apim_notes, resource_summaries, and platform_analyses."
+                "Foundry Agent response does not match the required architecture JSON schema."
             )
         note_keys = {"vnet_notes", "subnet_notes", "apim_notes"}
         if any(not isinstance(notes[key], str) for key in note_keys):
-            raise RuntimeError("Foundry model design-note values must all be strings.")
+            raise RuntimeError("Foundry Agent design-note values must all be strings.")
         for key, category in (
             ("vnet_notes", "vnets"),
             ("subnet_notes", "subnets"),
@@ -1819,72 +2256,211 @@ Design evidence:
                 )
                 notes[key] = ""
 
-        summaries = notes["resource_summaries"]
-        if not isinstance(summaries, list):
-            raise RuntimeError("Foundry model resource_summaries must be a JSON array.")
-        summary_by_id = {}
-        analysis_by_id = {}
-        for item in summaries:
+        classifications = notes["resource_classifications"]
+        if not isinstance(classifications, list):
+            raise RuntimeError(
+                "Foundry Agent resource_classifications must be a JSON array."
+            )
+        classification_fields = {
+            "resource_id",
+            "resource_name",
+            "azure_resource_type",
+            "vendor",
+            "product",
+            "category",
+            "technology",
+            "probable_role",
+            "environment",
+            "confidence",
+            "evidence",
+            "relationships",
+            "architecture_observations",
+            "recommendations",
+            "required_validation",
+        }
+        classification_by_id = {}
+        for item in classifications:
             if (
                 not isinstance(item, dict)
-                or set(item) != {"evidence_id", "summary"}
-                or not isinstance(item["evidence_id"], str)
-                or not isinstance(item["summary"], str)
+                or set(item) != classification_fields
+                or not isinstance(item["resource_id"], str)
             ):
                 raise RuntimeError(
-                    "Each resource summary must contain string evidence_id and summary fields."
+                    "Foundry Agent returned a malformed resource classification."
                 )
-            evidence_id = item["evidence_id"]
-            summary = " ".join(item["summary"].split())
-            if evidence_id not in expected_ids or evidence_id in summary_by_id:
-                raise RuntimeError(
-                    "Foundry model returned an unknown or duplicate resource evidence_id."
-                )
-            if not summary:
-                raise RuntimeError(
-                    f"Foundry model returned an empty summary for {evidence_id}."
-                )
-            summary_by_id[evidence_id] = summary
-        missing_summaries = expected_ids - set(summary_by_id)
-        if missing_summaries:
-            raise RuntimeError(
-                "Foundry model omitted resource summaries for evidence IDs: "
-                + ", ".join(sorted(missing_summaries))
-            )
-        notes["summary_by_id"] = summary_by_id
-        platform_analyses = notes["platform_analyses"]
-        if not isinstance(platform_analyses, list):
-            raise RuntimeError("Foundry model platform_analyses must be a JSON array.")
-        analysis_by_id = {}
-        for item in platform_analyses:
+            resource_id = item["resource_id"].strip().lower()
             if (
-                not isinstance(item, dict)
-                or set(item) != {"evidence_id", "analysis"}
-                or not isinstance(item["evidence_id"], str)
-                or not isinstance(item["analysis"], str)
+                resource_id not in expected_resources
+                or resource_id in classification_by_id
             ):
                 raise RuntimeError(
-                    "Each platform analysis must contain string evidence_id "
-                    "and analysis fields."
+                    "Foundry Agent returned an unknown or duplicate resource ID."
                 )
-            evidence_id = item["evidence_id"]
-            analysis = item["analysis"].strip()
-            if evidence_id not in expected_platform_ids or evidence_id in analysis_by_id:
+            resource = expected_resources[resource_id]
+            if item["resource_id"].strip().lower() != resource["resource_id"].lower():
                 raise RuntimeError(
-                    "Foundry model returned an unknown or duplicate platform evidence_id."
+                    "Foundry Agent changed the authoritative Azure resource ID."
                 )
-            if not analysis:
-                raise RuntimeError(
-                    f"Foundry model returned an empty platform analysis for {evidence_id}."
-                )
-            analysis_by_id[evidence_id] = analysis
-        missing_analyses = expected_platform_ids - set(analysis_by_id)
-        if missing_analyses:
-            raise RuntimeError(
-                "Foundry model omitted detailed platform analyses for evidence IDs: "
-                + ", ".join(sorted(missing_analyses))
+            text_fields = (
+                "resource_name",
+                "azure_resource_type",
+                "vendor",
+                "product",
+                "category",
+                "technology",
+                "probable_role",
+                "environment",
             )
-        notes["analysis_by_id"] = analysis_by_id
+            if any(not isinstance(item[field], str) for field in text_fields):
+                raise RuntimeError(
+                    "Foundry Agent classification string fields are malformed."
+                )
+            confidence = item["confidence"]
+            if (
+                isinstance(confidence, bool)
+                or not isinstance(confidence, (int, float))
+                or not 0 <= confidence <= 1
+            ):
+                raise RuntimeError(
+                    "Foundry Agent confidence must be a number from 0 to 1."
+                )
+            if not all(
+                isinstance(item[field], list)
+                and all(isinstance(value, str) for value in item[field])
+                for field in (
+                    "architecture_observations",
+                    "recommendations",
+                    "required_validation",
+                )
+            ):
+                raise RuntimeError(
+                    "Foundry Agent observation, recommendation, and validation "
+                    "fields must be arrays of strings."
+                )
+            if not isinstance(item["evidence"], list):
+                raise RuntimeError("Foundry Agent evidence must be a JSON array.")
+            if not item["evidence"]:
+                raise RuntimeError(
+                    "Foundry Agent classifications must cite at least one evidence item."
+                )
+            validated_evidence = []
+            for citation in item["evidence"]:
+                if (
+                    not isinstance(citation, dict)
+                    or set(citation) != {"attribute", "value", "source", "evidence"}
+                    or not all(
+                        isinstance(citation[field], str)
+                        for field in ("attribute", "value", "source", "evidence")
+                    )
+                    or not citation["attribute"].strip()
+                    or not citation["evidence"].strip()
+                    or citation["source"] != "azure_inventory"
+                ):
+                    raise RuntimeError(
+                        "Foundry Agent evidence citations must identify "
+                        "azure_inventory facts."
+                    )
+                validated_evidence.append(citation)
+            if not isinstance(item["relationships"], list):
+                raise RuntimeError("Foundry Agent relationships must be a JSON array.")
+            validated_relationships = []
+            for relationship in item["relationships"]:
+                if (
+                    not isinstance(relationship, dict)
+                    or set(relationship)
+                    != {"relationship", "target_resource", "purpose"}
+                    or not all(
+                        isinstance(relationship[field], str)
+                        for field in ("relationship", "target_resource", "purpose")
+                    )
+                ):
+                    raise RuntimeError(
+                        "Foundry Agent returned a malformed resource relationship."
+                    )
+                target_id = relationship["target_resource"].strip().lower()
+                if target_id not in known_resource_ids:
+                    raise RuntimeError(
+                        "Foundry Agent relationship references a resource ID "
+                        "not present in the collected inventory."
+                    )
+                validated_relationships.append({
+                    **relationship,
+                    "target_resource": known_resource_ids[target_id],
+                })
+            if item["resource_name"] != resource["name"]:
+                print(
+                    "WARNING: Agent resource name differed from Azure inventory; "
+                    "retaining the Azure value.",
+                    file=sys.stderr,
+                )
+            if item["azure_resource_type"] != resource["azure_type"]:
+                print(
+                    "WARNING: Agent resource type differed from Azure inventory; "
+                    "retaining the Azure value.",
+                    file=sys.stderr,
+                )
+            classification_by_id[resource_id] = {
+                **item,
+                "resource_id": resource["resource_id"],
+                "resource_name": resource["name"],
+                "azure_resource_type": resource["azure_type"],
+                "evidence": validated_evidence,
+                "relationships": validated_relationships,
+                "confidence": float(confidence),
+                "evidence_id": resource["evidence_id"],
+                "resource_type": resource["resource_type"],
+                "subscription": resource["subscription"],
+                "resource_group": resource["resource_group"],
+                "location": resource["location"],
+                "platform_detail_type": resource.get("platform_detail_type", ""),
+            }
+        missing_classifications = set(expected_resources) - set(classification_by_id)
+        if missing_classifications:
+            raise RuntimeError(
+                "Foundry Agent omitted classifications for resource IDs: "
+                + ", ".join(
+                    expected_resources[resource_id]["resource_id"]
+                    for resource_id in sorted(missing_classifications)
+                )
+            )
+        summary_categories = {
+            "network_architecture",
+            "security_architecture",
+            "application_delivery",
+            "connectivity",
+            "high_availability",
+        }
+        architecture_summary = notes["architecture_summary"]
+        if (
+            not isinstance(architecture_summary, dict)
+            or set(architecture_summary) != summary_categories
+            or any(
+                not isinstance(items, list)
+                or not all(isinstance(value, str) for value in items)
+                for items in architecture_summary.values()
+            )
+        ):
+            raise RuntimeError(
+                "Foundry Agent architecture_summary does not match the required schema."
+            )
+        if (
+            not isinstance(notes["findings"], list)
+            or not all(isinstance(value, str) for value in notes["findings"])
+        ):
+            raise RuntimeError("Foundry Agent findings must be an array of strings.")
+        citation_count = sum(
+            len(item["evidence"]) for item in classification_by_id.values()
+        )
+        relationship_count = sum(
+            len(item["relationships"]) for item in classification_by_id.values()
+        )
+        ai_log(
+            f"VALIDATED {request_label}: classifications="
+            f"{len(classification_by_id)}/{len(expected_resources)}, "
+            f"citations={citation_count}, relationships={relationship_count}, "
+            f"findings={len(notes['findings'])}; schema and inventory references passed."
+        )
+        notes["classification_by_id"] = classification_by_id
         return notes
 
     aggregated_notes = {
@@ -1892,49 +2468,75 @@ Design evidence:
         "subnet_notes": [],
         "apim_notes": [],
     }
-    summary_by_id = {}
-    analysis_by_id = {}
-    print(
-        f"Foundry enrichment: processing {len(batches)} sequential batch(es).",
-        file=sys.stderr,
+    classification_by_id = {}
+    aggregated_architecture = {
+        key: []
+        for key in (
+            "network_architecture",
+            "security_architecture",
+            "application_delivery",
+            "connectivity",
+            "high_availability",
+        )
+    }
+    aggregated_findings = []
+    ai_log(
+        f"PREPARED: {len(resource_evidence)} architecture resource(s), "
+        f"{len(work_items)} total evidence item(s), {len(batches)} sequential "
+        "batch(es). Evidence payloads are not printed."
     )
     try:
         for batch_number, batch in enumerate(batches, start=1):
-            print(
-                f"Foundry enrichment: batch {batch_number}/{len(batches)} "
-                f"({len(batch)} evidence item(s)).",
-                file=sys.stderr,
+            ai_log(
+                f"BATCH {batch_number}/{len(batches)}: starting with "
+                f"{len(batch)} evidence item(s)."
             )
-            batch_notes = request_batch(batch)
+            batch_notes = request_batch(batch, str(batch_number))
             for key in aggregated_notes:
                 if batch_notes[key].strip():
                     aggregated_notes[key].append(batch_notes[key].strip())
-            summary_by_id.update(batch_notes["summary_by_id"])
-            analysis_by_id.update(batch_notes["analysis_by_id"])
+            classification_by_id.update(batch_notes["classification_by_id"])
+            for category, entries in batch_notes["architecture_summary"].items():
+                aggregated_architecture[category].extend(entries)
+            aggregated_findings.extend(batch_notes["findings"])
     finally:
         project_client.close()
         credential.close()
+        if tracer_provider is not None:
+            try:
+                spans_flushed = tracer_provider.force_flush(timeout_millis=10000)
+                tracer_provider.shutdown()
+                if spans_flushed:
+                    ai_log("TRACING FLUSHED: exported pending Agent spans.")
+                else:
+                    ai_log(
+                        "TRACING EXPORT WARNING: the OTLP exporter did not "
+                        "confirm delivery; verify the collector endpoint is "
+                        "running and reachable."
+                    )
+            except Exception as error:
+                ai_log(
+                    "TRACING EXPORT WARNING: "
+                    f"{type(error).__name__}: {safe_error_detail(error)}"
+                )
 
-    resource_by_id = {
-        resource["evidence_id"]: resource for resource in resource_evidence
-    }
-    missing_summaries = set(resource_by_id) - set(summary_by_id)
-    if missing_summaries:
-        raise RuntimeError(
-            "Foundry model omitted resource summaries for evidence IDs: "
-            + ", ".join(sorted(missing_summaries))
-        )
+    ai_log(
+        f"MERGE: combining validated Agent analysis for "
+        f"{len(classification_by_id)} resource(s) with authoritative Azure inventory."
+    )
     result = {
         key: "\n\n".join(values) for key, values in aggregated_notes.items()
     }
-    result["resource_summaries"] = [
-        {**resource_by_id[evidence_id], "summary": summary_by_id[evidence_id]}
-        for evidence_id in resource_by_id
+    result["resource_classifications"] = [
+        classification_by_id[resource["resource_id"].lower()]
+        for resource in resource_evidence
+        if resource["resource_id"].lower() in classification_by_id
     ]
-    result["platform_analyses"] = [
-        {**resource_by_id[evidence_id], "analysis": analysis_by_id[evidence_id]}
-        for evidence_id in analysis_by_id
-    ]
+    result["architecture_summary"] = {
+        category: list(dict.fromkeys(entries))
+        for category, entries in aggregated_architecture.items()
+    }
+    result["findings"] = list(dict.fromkeys(aggregated_findings))
     return result
 
 
@@ -2670,11 +3272,41 @@ if selected_subscription_ids:
 model_enrichment_enabled = os.environ.get("MODEL_ENRICHMENT_ENABLED", "1")
 if model_enrichment_enabled not in {"0", "1"}:
     raise ValueError("MODEL_ENRICHMENT_ENABLED must be either 0 or 1.")
-model_design_notes = (
-    invoke_network_design_agent(subs)
-    if model_enrichment_enabled == "1"
-    else {}
-)
+model_design_notes = {}
+if model_enrichment_enabled == "1":
+    print(
+        "[AI] ENABLED: the script will attempt a Foundry Agent call after "
+        "inventory collection.",
+        flush=True,
+    )
+    try:
+        model_design_notes = invoke_network_design_agent(subs)
+    except Exception as error:
+        error_detail = re.sub(
+            r"(?i)\bBearer\s+\S+", "Bearer [redacted]", str(error)
+        )
+        error_detail = re.sub(
+            r"(?i)((?:api[_-]?key|access[_-]?token|password|secret)\s*[=:]\s*)[^\s,;]+",
+            r"\1[redacted]",
+            error_detail,
+        )
+        error_detail = re.sub(
+            r"(?i)/subscriptions/[^,\s'\";]+",
+            "[Azure resource ID redacted]",
+            error_detail,
+        )
+        print(
+            "[AI] ERROR: Foundry Agent analysis failed "
+            f"({type(error).__name__}: {error_detail[:600]}); "
+            "continuing with deterministic Azure inventory.",
+            flush=True,
+        )
+else:
+    print(
+        "[AI] DISABLED: MODEL_ENRICHMENT_ENABLED=0; no Foundry Agent call "
+        "will be made.",
+        flush=True,
+    )
 
 # ---------------------------------------------------------------------------
 # Use the uploaded document as the formatting baseline, but remove its
@@ -2776,12 +3408,14 @@ def get_status(rows):
 
 def generic_catalog_item(title, description=None):
 
+    catalog_name = re.sub(r"^\s*\d+(?:\.\d+)*\s*", "", title).strip().lower()
+
     return {
 
         "title": title,
 
         "description": description or (
-            f"This section inventories {title.split('.', 1)[-1].strip().lower()} "
+            f"This section inventories {catalog_name} "
             "returned by the Azure control plane."
         ),
 
@@ -3951,11 +4585,11 @@ for s in subs:
     for rg in s.get("inventory",{}).get("resource_groups",[]):
         for k,v in (rg.get("tags") or {}).items():
             tag_counts[k] = tag_counts.get(k,0)+1
-            tag_values.setdefault(k,set()).add(str(v))
+            tag_values.setdefault(k,set()).add(str(safe_tag_value(k, v)))
     for vm in s.get("inventory",{}).get("vms",[]):
         for k,v in (vm.get("tags") or {}).items():
             tag_counts[k] = tag_counts.get(k,0)+1
-            tag_values.setdefault(k,set()).add(str(v))
+            tag_values.setdefault(k,set()).add(str(safe_tag_value(k, v)))
 if tag_counts:
     tag_rows = [[k,tag_counts[k],"; ".join(sorted(tag_values.get(k,set()))[:10])] for k in sorted(tag_counts)]
 else:
@@ -3978,7 +4612,7 @@ for s in subs:
         continue
     add_table(
         ["Resource Group","Location","Provisioning State","Tags"],
-        [[r.get("name",""),r.get("location",""),r.get("provisioningState",""),"; ".join(f"{k}={v}" for k,v in (r.get("tags") or {}).items())] for r in rgs]
+        [[r.get("name",""),r.get("location",""),r.get("provisioningState",""),safe_tag_text(r.get("tags") or {})] for r in rgs]
     )
     add_caption(f"Resource Groups: {s.get('display_name','')}")
 
@@ -4211,39 +4845,131 @@ for s in subs:
 render_catalog_section("5. Compute And Storage")
 add_model_notes("5.22 API Management Design Notes", model_design_notes.get("apim_notes", ""))
 
-platform_analysis_rows = model_design_notes.get("platform_analyses", [])
+resource_classifications = model_design_notes.get("resource_classifications", [])
+platform_analysis_rows = [
+    resource
+    for resource in resource_classifications
+    if resource.get("platform_detail_type")
+]
 if platform_analysis_rows:
     add_heading("5.23 AKS, ARO, and VM Scale Set Design Analysis", 2)
-    add_para(
-        "The following analysis uses Azure Resource Manager evidence only. "
-        "It distinguishes observed configuration from recommendations and "
-        "validation items; it does not describe in-cluster workload state."
-    )
     platform_names = {
         "AKS": "Azure Kubernetes Service",
         "ARO": "Azure Red Hat OpenShift",
         "Virtual Machine Scale Set": "Virtual Machine Scale Set",
     }
-    for platform in platform_analysis_rows:
-        platform_type = platform.get("platform_detail_type", "Platform")
-        resource_name = platform.get("name", "Unnamed resource")
-        subscription_name = platform.get("subscription", "")
-        heading = (
-            f"{platform_names.get(platform_type, platform_type)}: {resource_name}"
-        )
-        if subscription_name:
-            heading += f" ({subscription_name})"
-        add_heading(heading, 3)
-        for paragraph in re.split(r"\n\s*\n", platform.get("analysis", "").strip()):
-            if paragraph.strip():
-                add_para(paragraph.strip())
+
+    def platform_analysis_cell(values):
+        entries = [
+            str(value).strip()
+            for value in values
+            if isinstance(value, str) and value.strip()
+        ]
+        return entries or ["Not provided by Agent"]
+
+    add_table(
+        [
+            "Platform / Resource",
+            "Observed",
+            "Recommendation",
+            "Required Validation",
+            "Relationships",
+        ],
+        [
+            [
+                " | ".join(
+                    value
+                    for value in (
+                        platform_names.get(
+                            platform.get("platform_detail_type", ""),
+                            platform.get("platform_detail_type", "Platform"),
+                        ),
+                        platform.get("resource_name", ""),
+                        platform.get("subscription", ""),
+                    )
+                    if value
+                ),
+                platform_analysis_cell(
+                    platform.get("architecture_observations", [])
+                ),
+                platform_analysis_cell(platform.get("recommendations", [])),
+                platform_analysis_cell(platform.get("required_validation", [])),
+                platform_analysis_cell([
+                    " | ".join(
+                        value
+                        for value in (
+                            relationship.get("relationship", ""),
+                            relationship.get("target_resource", ""),
+                            relationship.get("purpose", ""),
+                        )
+                        if value
+                    )
+                    for relationship in platform.get("relationships", [])
+                    if isinstance(relationship, dict)
+                ]),
+            ]
+            for platform in platform_analysis_rows
+        ],
+    )
+    add_caption("Table: AKS, ARO, and VM Scale Set Architecture Analysis")
+
+architecture_summary = model_design_notes.get("architecture_summary", {})
+if any(architecture_summary.values()):
+    add_heading("5.24 Agent Architecture Summary", 2)
+    for category, heading in (
+        ("network_architecture", "Network Architecture"),
+        ("security_architecture", "Security Architecture"),
+        ("application_delivery", "Application Delivery"),
+        ("connectivity", "Connectivity"),
+        ("high_availability", "High Availability"),
+    ):
+        entries = architecture_summary.get(category, [])
+        if entries:
+            add_heading(heading, 3)
+            add_bullets(entries)
+
+agent_findings = model_design_notes.get("findings", [])
+if agent_findings:
+    add_heading("5.25 Agent Findings and Required Review", 2)
+    add_bullets(agent_findings)
 
 detected_nvas = {}
+classification_by_resource_id = {
+    resource.get("resource_id", "").lower(): resource
+    for resource in resource_classifications
+    if resource.get("resource_id")
+}
+vendor_mismatch_warnings = []
 for subscription in subs:
     inventory_section = subscription.get("inventory", {})
     for vm in inventory_section.get("vms", []) or []:
         detection = vm.get("vendor_detection") or {}
         vendor = detection.get("vendor", "Unknown")
+        agent_classification = classification_by_resource_id.get(
+            str(vm.get("id", "")).lower(), {}
+        )
+        agent_vendor = agent_classification.get("vendor", "")
+        vendor_aliases = {
+            "f5 networks": "f5",
+            "palo alto networks": "palo alto",
+            "fortigate": "fortinet",
+            "check point software technologies": "check point",
+        }
+        normalized_vendor = vendor_aliases.get(vendor.lower(), vendor.lower())
+        normalized_agent_vendor = vendor_aliases.get(
+            agent_vendor.lower(), agent_vendor.lower()
+        )
+        if (
+            vendor not in ("", "Unknown")
+            and agent_vendor
+            and normalized_vendor != normalized_agent_vendor
+        ):
+            vendor_mismatch_warnings.append((
+                str(vm.get("id", "")).lower(),
+                f"{vm.get('name', 'Unnamed VM')}: deterministic Azure evidence "
+                f"classifies {vendor}; Foundry Agent classifies {agent_vendor}. "
+                "Manual validation is required.",
+            ))
         if vendor not in ("", "Unknown"):
             detected_nvas.setdefault(vendor, []).append((subscription, vm, detection))
 
@@ -4270,9 +4996,7 @@ if detected_nvas:
                 for key in ("publisher", "product", "name")
                 if plan.get(key)
             )
-            tags_text = "; ".join(
-                f"{key}={value}" for key, value in sorted(tags.items())
-            )
+            tags_text = safe_tag_text(tags)
             detection_rows.append([
                 vm.get("name", ""),
                 subscription.get("display_name", ""),
@@ -4330,6 +5054,16 @@ if detected_nvas:
             detection_rows,
         )
         add_caption(f"{vendor} vendor detection evidence")
+        vendor_resource_ids = {
+            str(vm.get("id", "")).lower() for _, vm, _ in records
+        }
+        vendor_warnings = [
+            warning
+            for resource_id, warning in vendor_mismatch_warnings
+            if resource_id in vendor_resource_ids
+        ]
+        if vendor_warnings:
+            add_para("Classification mismatch warning: " + " ".join(vendor_warnings))
         add_table(
             [
                 "VM Name", "Subscription", "NIC", "Private IPs", "Subnet",
@@ -4632,37 +5366,68 @@ for s in subs:
 add_table(["Subscription","ID","RGs","VNets","VMs","Storage","Key Vaults","APIM Services","Policies"],summary_rows)
 add_caption("Table 24: Subscription Summary")
 
-resource_summary_rows = model_design_notes.get("resource_summaries", [])
-if resource_summary_rows:
-    add_heading("12.2 AI-Generated Resource Highlights", 2)
+if resource_classifications:
+    add_heading("12.2 AI-Generated Architecture Classification", 2)
     add_para(
-        "Summaries cover selected network components, virtual machines, databases, "
-        "and Azure AI resources using the collected evidence. They are intended as "
-        "a concise orientation, not as a compliance assessment or a substitute "
-        "for detailed resource configuration."
+        "Classifications are agent analysis of supplied Azure evidence. Resource "
+        "IDs, names, types, locations, and other Azure facts remain authoritative "
+        "from the collected inventory. Appliance internals and workload state are "
+        "not inferred from Azure control-plane metadata."
     )
     add_table(
         [
             "Resource Type",
-            "Name",
-            "Resource Group",
-            "Subscription",
-            "Region",
-            "AI-Generated Summary",
+            "Name / Resource ID",
+            "Vendor / Product",
+            "Category / Technology",
+            "Probable Role",
+            "Environment / Confidence",
+            "Evidence",
         ],
         [
             [
-                resource.get("resource_type", ""),
-                resource.get("name", ""),
-                resource.get("resource_group", ""),
-                resource.get("subscription", ""),
-                resource.get("location", ""),
-                resource.get("summary", ""),
+                resource.get("azure_resource_type", ""),
+                "\n".join(
+                    value for value in (
+                        resource.get("resource_name", ""),
+                        resource.get("resource_id", ""),
+                        " / ".join(
+                            value for value in (
+                                resource.get("resource_group", ""),
+                                resource.get("subscription", ""),
+                            ) if value
+                        ),
+                    ) if value
+                ),
+                " / ".join(
+                    value for value in (
+                        resource.get("vendor", ""),
+                        resource.get("product", ""),
+                    ) if value
+                ),
+                " / ".join(
+                    value for value in (
+                        resource.get("category", ""),
+                        resource.get("technology", ""),
+                    ) if value
+                ),
+                resource.get("probable_role", ""),
+                " / ".join(
+                    value for value in (
+                        resource.get("environment", ""),
+                        f"{resource.get('confidence', 0):.2f}",
+                    ) if value
+                ),
+                "; ".join(
+                    f"{citation.get('attribute', '')}={citation.get('value', '')} "
+                    f"[{citation.get('source', '')}]"
+                    for citation in resource.get("evidence", [])
+                ),
             ]
-            for resource in resource_summary_rows
+            for resource in resource_classifications
         ],
     )
-    add_caption("Table 25: AI-Generated Resource Highlights")
+    add_caption("Table 25: AI-Generated Architecture Classification")
 
 add_heading("12.3 Glossary of Terms", 2)
 add_table(["Term","Definition"],[
