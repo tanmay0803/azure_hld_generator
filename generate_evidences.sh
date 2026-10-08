@@ -26,18 +26,38 @@
 #   HLD_APPROVER="TBD"
 #   HLD_CLASSIFICATION="Confidential"
 #   HLD_REGION="UAE North"
+#   SUBSCRIPTION_IDS="<id1>,<id2>" to limit inventory to selected subscriptions
 #   REUSE_INVENTORY="1" to skip Azure discovery and reuse inventory.json
 #   MG_STRUCTURE_FILE="./management_group_structure.txt" for portal-pasted evidence
 #   MG_STRUCTURE_IMAGE="./management_group_structure.png" for portal screenshot evidence
+#   FOUNDRY_PROJECT_ENDPOINT, FOUNDRY_AGENT_NAME, FOUNDRY_AGENT_VERSION
+#   FOUNDRY_MAX_INPUT_CHARS=9000 to set the serialized evidence batch size
+#   MODEL_ENRICHMENT_ENABLED=0 to skip Foundry agent design-note enrichment
+#   AGENT_ENRICHMENT_ENABLED remains accepted as a legacy setting
+#   The script automatically loads ENV_FILE (default: ./.env) when present.
 #
 # Notes:
 #   - Read-only discovery only. No Azure resources are changed.
+#   - Foundry agent authentication uses DefaultAzureCredential.
+#   - The agent also writes one evidence-grounded summary for each inventoried resource.
 #   - The generated document reports what Azure exposes to the current identity.
 #   - Resources for which the caller lacks read permission are recorded as
 #     "Not accessible" rather than invented.
 # ==============================================================================
 
 set -uo pipefail
+
+ENV_FILE="${ENV_FILE:-.env}"
+if [[ -f "$ENV_FILE" ]]; then
+  set -a
+  source "$ENV_FILE" || {
+    echo "ERROR: Could not load environment file: $ENV_FILE"
+    exit 1
+  }
+  set +a
+fi
+MODEL_ENRICHMENT_ENABLED="${MODEL_ENRICHMENT_ENABLED:-${AGENT_ENRICHMENT_ENABLED:-1}}"
+export MODEL_ENRICHMENT_ENABLED
 
 MG_ID="${1:-}"
 TEMPLATE="${2:-Esolutions_LLD_v0.2.docx}"
@@ -63,6 +83,14 @@ fi
 
 if ! command -v python3 >/dev/null 2>&1; then
   echo "ERROR: Python 3 is required."
+  exit 1
+fi
+
+if [[ "$MODEL_ENRICHMENT_ENABLED" != "0" ]] &&
+   ! python3 -c "from azure.ai.projects import AIProjectClient; from azure.identity import DefaultAzureCredential; from openai import RateLimitError" >/dev/null 2>&1; then
+  echo "ERROR: Foundry agent enrichment requires azure-ai-projects, azure-identity, and openai."
+  echo 'Install them with: python3 -m pip install "azure-ai-projects>=2.1.0" azure-identity openai'
+  echo "Or set MODEL_ENRICHMENT_ENABLED=0 to skip Foundry agent enrichment."
   exit 1
 fi
 
@@ -271,6 +299,27 @@ for sid_obj in run(["az","account","management-group","subscription","show",
                 "management_group_path": MG_ID,
                 "management_group": MG_ID
             })
+
+selected_subscription_ids = {
+    sid.strip().lower()
+    for sid in os.environ.get("SUBSCRIPTION_IDS", "").split(",")
+    if sid.strip()
+}
+if selected_subscription_ids:
+    discovered_ids = {sid.lower() for sid in subscriptions}
+    missing_ids = selected_subscription_ids - discovered_ids
+    if missing_ids:
+        print(
+            "ERROR: SUBSCRIPTION_IDS contains subscriptions not discovered "
+            f"under management group {MG_ID}: {', '.join(sorted(missing_ids))}",
+            file=sys.stderr
+        )
+        sys.exit(1)
+    subscriptions = {
+        sid: subscription
+        for sid, subscription in subscriptions.items()
+        if sid.lower() in selected_subscription_ids
+    }
 
 subs = sorted(subscriptions.values(), key=lambda x: x["subscription_id"])
 
@@ -829,6 +878,39 @@ for idx, s in enumerate(subs, 1):
         []
     )
 
+    apim_services = az_for_sub(
+        sid,
+        ["apim", "list"],
+        []
+    )
+    if not apim_services:
+        apim_services = arg_query(
+            sid,
+            """
+Resources
+| where type =~ 'microsoft.apimanagement/service'
+| project id, name, resourceGroup, location, type, sku, properties, tags
+"""
+        )
+    for apim in apim_services:
+        apim["type"] = apim.get("type") or "Microsoft.ApiManagement/service"
+        if not apim.get("resourceGroup"):
+            resource_id_parts = str(apim.get("id") or "").split("/")
+            for index, part in enumerate(resource_id_parts[:-1]):
+                if part.lower() == "resourcegroups":
+                    apim["resourceGroup"] = resource_id_parts[index + 1]
+                    break
+        properties = apim.get("properties") or {}
+        for key in (
+            "publicNetworkAccess",
+            "virtualNetworkType",
+            "gatewayUrl",
+            "developerPortalUrl",
+            "provisioningState",
+        ):
+            if apim.get(key) in (None, "") and properties.get(key) not in (None, ""):
+                apim[key] = properties[key]
+
 
     # =========================================================================
     # AI / Foundry / Cognitive Services
@@ -864,27 +946,53 @@ for idx, s in enumerate(subs, 1):
         if nic.get("id")
     }
     for vm in vms:
-        osdisk = (vm.get("storageProfile") or {}).get("osDisk") or {}
+        image = ((vm.get("storageProfile") or {}).get("imageReference") or {})
+        plan = vm.get("plan") or {}
+        tags = vm.get("tags") or {}
         vm_nics = (vm.get("networkProfile") or {}).get("networkInterfaces") or []
         public_access = "Unknown"
+        nic_rows = []
         if vm_nics:
             public_access = "Disabled"
             for vm_nic in vm_nics:
-                nic = nic_by_id.get((vm_nic.get("id") or "").lower(), {})
-                for ip_config in nic.get("ipConfigurations", []) or []:
+                nic_id = vm_nic.get("id") or ""
+                nic = nic_by_id.get(nic_id.lower(), {})
+                ip_configs = nic.get("ipConfigurations", []) or []
+                private_ips = [
+                    config.get("privateIPAddress", "")
+                    for config in ip_configs
+                    if config.get("privateIPAddress")
+                ]
+                subnet_ids = [
+                    (config.get("subnet") or {}).get("id", "")
+                    for config in ip_configs
+                    if (config.get("subnet") or {}).get("id")
+                ]
+                public_ip_ids = []
+                for ip_config in ip_configs:
                     public_ip = ip_config.get("publicIPAddress") or {}
                     if public_ip.get("id") or public_ip.get("ipAddress"):
                         public_access = "Enabled"
-                        break
-                if public_access == "Enabled":
-                    break
+                        if public_ip.get("id"):
+                            public_ip_ids.append(public_ip["id"])
+                nic_rows.append({
+                    "name": nic.get("name", nic_id.rsplit("/", 1)[-1]),
+                    "id": nic_id,
+                    "private_ips": private_ips,
+                    "subnet_ids": sorted(set(subnet_ids)),
+                    "nsg_id": (nic.get("networkSecurityGroup") or {}).get("id", ""),
+                    "public_ip_ids": sorted(set(public_ip_ids)),
+                })
         vm_rows.append({
             "name": vm.get("name",""),
             "resource_group": vm.get("resourceGroup",""),
             "location": vm.get("location",""),
             "size": (vm.get("hardwareProfile") or {}).get("vmSize",""),
             "os_type": ((vm.get("storageProfile") or {}).get("osDisk") or {}).get("osType",""),
-            "image": ((vm.get("storageProfile") or {}).get("imageReference") or {}),
+            "image": image if isinstance(image, dict) else {},
+            "marketplace_plan": plan if isinstance(plan, dict) else {},
+            "tags": tags if isinstance(tags, dict) else {},
+            "network_interfaces": nic_rows,
             "zone": (vm.get("zones") or [""])[0] if vm.get("zones") else "",
             "public_access": public_access,
             "id": vm.get("id",""),
@@ -896,6 +1004,7 @@ for idx, s in enumerate(subs, 1):
     for v in vnets:
         for sn in v.get("subnets", []) or []:
             subnet_rows.append({
+                "id": sn.get("id",""),
                 "vnet": v.get("name",""),
                 "resource_group": v.get("resourceGroup",""),
                 "location": v.get("location",""),
@@ -918,6 +1027,7 @@ for idx, s in enumerate(subs, 1):
         appgws,
         load_balancers,
         afd_profiles,
+        apim_services,
     ):
         for resource in resource_set or []:
             resource_id = resource.get("id") or resource.get("resourceId")
@@ -974,6 +1084,7 @@ for idx, s in enumerate(subs, 1):
         "ai_resources": ai_resources,
         "logic_apps": logic_apps,
         "eventgrid_topics": eventgrid_topics,
+        "apim_services": apim_services,
         "dcrs": dcrs,
                 
     }
@@ -1026,7 +1137,7 @@ export TEMPLATE OUTPUT INVENTORY
 export MG_STRUCTURE_FILE="${MG_STRUCTURE_FILE:-./management_group_structure.txt}"
 export MG_STRUCTURE_IMAGE="${MG_STRUCTURE_IMAGE:-./management_group_structure.png}"
 python3 - <<'PY'
-import json, os, re, copy, sys
+import json, os, re, copy, sys, time
 from pathlib import Path
 from datetime import datetime, timezone
 from docx import Document
@@ -1039,6 +1150,619 @@ from docx.oxml.ns import qn
 template = Path(os.environ["TEMPLATE"])
 output = Path(os.environ["OUTPUT"])
 data = json.loads(Path(os.environ["INVENTORY"]).read_text())
+
+
+def classify_vm_vendor(name, image, plan, tags):
+    image = image if isinstance(image, dict) else {}
+    plan = plan if isinstance(plan, dict) else {}
+    tags = tags if isinstance(tags, dict) else {}
+    values = {
+        "image_publisher": str(image.get("publisher") or ""),
+        "image_offer": str(image.get("offer") or ""),
+        "image_sku": str(image.get("sku") or ""),
+        "marketplace_plan": " ".join(
+            str(plan.get(key) or "") for key in ("publisher", "product", "name")
+        ),
+        "vm_name": str(name or ""),
+        "tags": " ".join(f"{key} {value}" for key, value in tags.items()),
+    }
+    evidence = {
+        "publisher": values["image_publisher"],
+        "offer": values["image_offer"],
+        "sku": values["image_sku"],
+        "plan": plan,
+        "name": values["vm_name"],
+        "tags": tags,
+    }
+    known = {
+        "F5": ("BIG-IP", "F5 BIG-IP", ("f5", "big-?ip")),
+        "Palo Alto": ("VM-Series", "Palo Alto VM-Series", (
+            "palo[-_ ]?alto", "paloaltonetworks", "vm[-_ ]?series",
+        )),
+        "Fortinet": ("FortiGate", "Fortinet FortiGate", (
+            "fortinet", "forti[-_ ]?gate",
+        )),
+        "Cisco": ("Cisco NVA", "Cisco NVA", (
+            "cisco", "csr1000v", "catalyst[-_ ]?8000v",
+        )),
+        "Check Point": ("CloudGuard", "Check Point CloudGuard", (
+            "check[-_ ]?point", "checkpoint", "cloudguard",
+        )),
+    }
+    metadata_sources = (
+        "image_publisher", "image_offer", "image_sku", "marketplace_plan",
+    )
+    scores = {}
+    matches = {}
+    for vendor, (_, _, aliases) in known.items():
+        metadata = []
+        weak = []
+        for source, value in values.items():
+            if any(
+                re.search(r"(?<![a-z0-9])" + alias + r"(?![a-z0-9])", value, re.I)
+                for alias in aliases
+            ):
+                (metadata if source in metadata_sources else weak).append(source)
+        if metadata:
+            scores[vendor] = (2, len(metadata))
+        elif weak:
+            scores[vendor] = (1, len(weak))
+        matches[vendor] = metadata + weak
+
+    if scores:
+        best = max(scores.values())
+        winners = [vendor for vendor, score in scores.items() if score == best]
+        if len(winners) == 1:
+            vendor = winners[0]
+            product, detected_product, _ = known[vendor]
+            return {
+                "vendor": vendor,
+                "product": product,
+                "detected_product": detected_product,
+                "confidence": "high" if best[0] == 2 else "medium",
+                "detection_source": matches[vendor],
+                "evidence": evidence,
+            }
+        return {
+            "vendor": "Unknown",
+            "product": "",
+            "detected_product": "Conflicting vendor signals",
+            "confidence": "low",
+            "detection_source": sorted({
+                source for vendor in winners for source in matches[vendor]
+            }),
+            "evidence": evidence,
+        }
+
+    metadata_text = " ".join(values[key].lower() for key in metadata_sources)
+    if re.search(r"\b(?:nva|network[-_ ]virtual[-_ ]appliance)\b", metadata_text):
+        product = values["image_offer"] or values["image_sku"] or "Network Virtual Appliance"
+        return {
+            "vendor": "Other NVA",
+            "product": product,
+            "detected_product": product,
+            "confidence": "medium",
+            "detection_source": [key for key in metadata_sources if values[key]],
+            "evidence": evidence,
+        }
+    return {
+        "vendor": "Unknown",
+        "product": "",
+        "detected_product": "Unknown",
+        "confidence": "low",
+        "detection_source": [],
+        "evidence": evidence,
+    }
+
+
+for subscription in data.get("subscriptions", []) or []:
+    for vm in (subscription.get("inventory") or {}).get("vms", []) or []:
+        vm["vendor_detection"] = classify_vm_vendor(
+            vm.get("name", ""),
+            vm.get("image") or {},
+            vm.get("marketplace_plan") or {},
+            vm.get("tags") or {},
+        )
+if os.environ.get("REUSE_INVENTORY", "0") != "1":
+    Path(os.environ["INVENTORY"]).write_text(json.dumps(data, indent=2))
+
+
+def invoke_network_design_agent(subscriptions):
+    evidence = {"vnets": [], "subnets": [], "apim_services": []}
+    resource_evidence = []
+    summary_inventory_types = {
+        "nsgs",
+        "route_tables",
+        "peerings",
+        "public_ips",
+        "vms",
+        "application_gateways",
+        "firewalls",
+        "firewall_policies",
+        "frontdoor_profiles",
+        "load_balancers",
+        "bastions",
+        "network_interfaces",
+        "private_endpoints",
+        "private_dns_zones",
+        "network_watchers",
+        "sql_servers",
+        "postgres_servers",
+        "cosmos_accounts",
+        "ai_resources",
+    }
+    summary_fields = (
+        "sku",
+        "kind",
+        "state",
+        "provisioningState",
+        "publicNetworkAccess",
+        "virtualNetworkType",
+        "addressSpace",
+        "address_prefixes",
+        "os_type",
+        "size",
+        "image",
+        "marketplace_plan",
+        "vendor_detection",
+        "gatewayUrl",
+        "developerPortalUrl",
+        "capacity",
+        "tier",
+        "accessTier",
+        "minimumTlsVersion",
+        "httpsOnly",
+    )
+    safe_property_fields = (
+        "provisioningState",
+        "publicNetworkAccess",
+        "virtualNetworkType",
+        "state",
+        "gatewayUrl",
+        "developerPortalUrl",
+        "sku",
+        "addressSpace",
+        "accessTier",
+        "minimumTlsVersion",
+        "httpsOnly",
+        "zoneRedundant",
+        "capacity",
+        "tier",
+        "enableSoftDelete",
+        "enablePurgeProtection",
+    )
+
+    def compact_value(value, depth=0):
+        if isinstance(value, str):
+            return value[:200]
+        if isinstance(value, (bool, int, float)) or value is None:
+            return value
+        if depth >= 2:
+            return str(value)[:200]
+        if isinstance(value, dict):
+            return {
+                str(key): compact_value(item, depth + 1)
+                for key, item in list(value.items())[:10]
+            }
+        if isinstance(value, list):
+            return [compact_value(item, depth + 1) for item in value[:8]]
+        return str(value)[:200]
+
+    for subscription in subscriptions:
+        inventory = subscription.get("inventory") or {}
+        subscription_name = subscription.get(
+            "display_name", subscription.get("subscription_id", "")
+        )
+        subscription_id = subscription.get("subscription_id", subscription_name)
+        for resource_type, resources in inventory.items():
+            if (
+                resource_type not in summary_inventory_types
+                or not isinstance(resources, list)
+            ):
+                continue
+            for index, resource in enumerate(resources):
+                if not isinstance(resource, dict):
+                    continue
+                resource_id = f"{subscription_id}:{resource_type}:{index}"
+                facts = {
+                    "evidence_id": resource_id,
+                    "resource_type": resource_type.replace("_", " ").title(),
+                    "subscription": subscription_name,
+                    "name": resource.get("name", ""),
+                    "resource_group": resource.get(
+                        "resourceGroup", resource.get("resource_group", "")
+                    ),
+                    "location": resource.get("location", ""),
+                    "azure_type": resource.get("type", ""),
+                }
+                for field in summary_fields:
+                    if resource.get(field) not in (None, "", [], {}):
+                        facts[field] = compact_value(resource[field])
+                properties = resource.get("properties")
+                if isinstance(properties, dict):
+                    safe_properties = {
+                        field: properties[field]
+                        for field in safe_property_fields
+                        if properties.get(field) not in (None, "", [], {})
+                    }
+                    if safe_properties:
+                        facts["properties"] = compact_value(safe_properties)
+                resource_evidence.append(facts)
+
+        for vnet in inventory.get("vnets", []) or []:
+            evidence["vnets"].append({
+                "subscription": subscription_name,
+                "name": vnet.get("name", ""),
+                "resource_group": vnet.get("resourceGroup", ""),
+                "location": vnet.get("location", ""),
+                "address_prefixes": (vnet.get("addressSpace") or {}).get(
+                    "addressPrefixes", []
+                ),
+                "subnet_names": [
+                    subnet.get("name", "")
+                    for subnet in vnet.get("subnets", []) or []
+                ],
+                "tags": vnet.get("tags") or {},
+            })
+        for subnet in inventory.get("subnets", []) or []:
+            evidence["subnets"].append({
+                "subscription": subscription_name,
+                "vnet": subnet.get("vnet", ""),
+                "name": subnet.get("name", ""),
+                "resource_group": subnet.get("resource_group", ""),
+                "location": subnet.get("location", ""),
+                "address_prefixes": subnet.get("address_prefixes") or [],
+                "nsg": resource_name_from_id(subnet.get("nsg_id", "")),
+                "route_table": resource_name_from_id(subnet.get("route_table_id", "")),
+                "delegations": subnet.get("delegations") or [],
+                "private_endpoint_network_policies": subnet.get(
+                    "private_endpoint_network_policies"
+                ),
+                "private_link_service_network_policies": subnet.get(
+                    "private_link_service_network_policies"
+                ),
+            })
+        for apim in inventory.get("apim_services", []) or []:
+            properties = apim.get("properties") or {}
+            evidence["apim_services"].append({
+                "subscription": subscription_name,
+                "name": apim.get("name", ""),
+                "resource_group": apim.get("resourceGroup", ""),
+                "location": apim.get("location", ""),
+                "sku": apim.get("sku") or {},
+                "public_network_access": (
+                    apim.get("publicNetworkAccess")
+                    or properties.get("publicNetworkAccess")
+                ),
+                "virtual_network_type": (
+                    apim.get("virtualNetworkType")
+                    or properties.get("virtualNetworkType")
+                ),
+                "gateway_url": apim.get("gatewayUrl") or properties.get("gatewayUrl"),
+                "developer_portal_url": (
+                    apim.get("developerPortalUrl")
+                    or properties.get("developerPortalUrl")
+                ),
+                "tags": apim.get("tags") or {},
+            })
+
+    if not any(evidence.values()) and not resource_evidence:
+        return {}
+
+    try:
+        from azure.ai.projects import AIProjectClient
+        from azure.identity import DefaultAzureCredential
+        from openai import RateLimitError
+    except ImportError as error:
+        raise RuntimeError(
+            "Foundry agent enrichment requires azure-ai-projects, azure-identity, "
+            "and openai. Install them with: python3 -m pip install "
+            '"azure-ai-projects>=2.1.0" azure-identity openai'
+        ) from error
+
+    project_endpoint = os.environ.get(
+        "FOUNDRY_PROJECT_ENDPOINT",
+        "https://foundrylld01.services.ai.azure.com/api/projects/proj-lld",
+    )
+    agent_name = os.environ.get("FOUNDRY_AGENT_NAME", "LLD-agent")
+    agent_version = os.environ.get("FOUNDRY_AGENT_VERSION", "1")
+    if not project_endpoint.strip():
+        raise ValueError("FOUNDRY_PROJECT_ENDPOINT must not be empty.")
+    if not agent_name.strip():
+        raise ValueError("FOUNDRY_AGENT_NAME must not be empty.")
+    if not agent_version.strip():
+        raise ValueError("FOUNDRY_AGENT_VERSION must not be empty.")
+    try:
+        max_input_chars = int(os.environ.get("FOUNDRY_MAX_INPUT_CHARS", "9000"))
+    except ValueError as error:
+        raise ValueError("FOUNDRY_MAX_INPUT_CHARS must be a positive integer.") from error
+    if max_input_chars < 1000:
+        raise ValueError("FOUNDRY_MAX_INPUT_CHARS must be at least 1000.")
+
+    work_items = []
+    for category, entries in (
+        ("vnets", evidence["vnets"]),
+        ("subnets", evidence["subnets"]),
+        ("apim_services", evidence["apim_services"]),
+    ):
+        work_items.extend(
+            {"kind": category, "data": entry} for entry in entries
+        )
+    work_items.extend(
+        {"kind": "resource_summary", "data": resource}
+        for resource in resource_evidence
+    )
+
+    def serialized_size(item):
+        return len(json.dumps(item, separators=(",", ":"), ensure_ascii=False))
+
+    batches = []
+    current_batch = []
+    current_size = 0
+    for item in work_items:
+        item_size = serialized_size(item)
+        if current_batch and current_size + item_size > max_input_chars:
+            batches.append(current_batch)
+            current_batch = []
+            current_size = 0
+        current_batch.append(item)
+        current_size += item_size
+    if current_batch:
+        batches.append(current_batch)
+
+    print(
+        "Foundry enrichment scope: VNet/subnet/APIM design plus "
+        f"{len(resource_evidence)} selected network, VM, database, and AI resource(s).",
+        file=sys.stderr,
+    )
+    credential = DefaultAzureCredential()
+    project_client = AIProjectClient(
+        endpoint=project_endpoint,
+        credential=credential,
+    )
+    openai_client = project_client.get_openai_client()
+
+    def retry_delay_seconds(error, attempt):
+        headers = getattr(getattr(error, "response", None), "headers", {}) or {}
+        retry_after_ms = headers.get("retry-after-ms")
+        if retry_after_ms is not None:
+            try:
+                return max(float(retry_after_ms) / 1000, 0.25)
+            except (TypeError, ValueError):
+                pass
+        retry_after = headers.get("retry-after")
+        if retry_after is not None:
+            try:
+                return max(float(retry_after), 0.25)
+            except (TypeError, ValueError):
+                pass
+        token_reset = headers.get("x-ratelimit-reset-tokens", "")
+        match = re.fullmatch(r"\s*(\d+(?:\.\d+)?)s?\s*", str(token_reset))
+        if match:
+            return max(float(match.group(1)), 0.25)
+        return min(2 ** (attempt + 1), 30)
+
+    def request_batch(batch, retry_attempt=0):
+        batch_evidence = {
+            "network_design": {
+                "vnets": [
+                    item["data"] for item in batch if item["kind"] == "vnets"
+                ],
+                "subnets": [
+                    item["data"] for item in batch if item["kind"] == "subnets"
+                ],
+                "apim_services": [
+                    item["data"]
+                    for item in batch
+                    if item["kind"] == "apim_services"
+                ],
+            },
+            "resources": [
+                item["data"]
+                for item in batch
+                if item["kind"] == "resource_summary"
+            ],
+        }
+        expected_ids = {
+            resource["evidence_id"] for resource in batch_evidence["resources"]
+        }
+        prompt = f"""
+Enrich the High Level Design with evidence-grounded design notes for Azure VNets,
+subnets, and API Management (APIM), and one-line summaries for the supplied
+resources.
+
+Use the Azure QC Control Library, Naming Standards, Tagging Standards, Policies,
+HLD and LLD available in your knowledge base as reference expectations where
+relevant. Treat the supplied JSON as the complete observed state for this batch.
+
+Rules:
+- Separate observed facts from recommendations.
+- Do not invent connectivity, routes, NSG rules, private endpoints, APIM modes,
+  security controls, or compliance results not shown in the evidence.
+- Treat a missing field as "not reported / requires validation", not as enabled
+  or disabled.
+- For public access, report the APIM public network access value exactly as given;
+  do not infer actual reachability from a URL or VNet configuration.
+- Write concise, practical HLD notes and call out material missing evidence.
+- Keep each note as plain-text paragraphs suitable for insertion into a Word HLD.
+- Label recommendations and required validations distinctly from observed facts.
+- Return exactly one JSON object with string properties "vnet_notes",
+  "subnet_notes", and "apim_notes", plus a "resource_summaries" array. Use an
+  empty string for a category with no evidence in this batch. Include exactly
+  one summary object for every supplied selected network, VM, database, or
+  Azure AI resource in this batch's resource evidence,
+  preserving its "evidence_id". Each summary must be one concise,
+  evidence-grounded sentence (maximum 25 words), with no assumptions about
+  unobserved configuration. Do not omit or duplicate resources. Do not include
+  Markdown fences or any text outside the JSON object.
+
+Design evidence:
+{json.dumps(batch_evidence, ensure_ascii=False)}
+"""
+        try:
+            response = openai_client.responses.create(
+                input=[{"role": "user", "content": prompt}],
+                extra_body={
+                    "agent_reference": {
+                        "name": agent_name,
+                        "version": agent_version,
+                        "type": "agent_reference",
+                    }
+                },
+            )
+        except RateLimitError as error:
+            if len(batch) > 1:
+                delay = retry_delay_seconds(error, retry_attempt)
+                print(
+                    "WARNING: Foundry token rate limit hit; splitting a batch "
+                    f"of {len(batch)} evidence items and retrying sequentially "
+                    f"after {delay:g}s.",
+                    file=sys.stderr,
+                )
+                time.sleep(delay)
+                midpoint = len(batch) // 2
+                left = request_batch(batch[:midpoint])
+                right = request_batch(batch[midpoint:])
+                combined = {
+                    key: "\n\n".join(
+                        value for value in (left[key], right[key]) if value
+                    )
+                    for key in ("vnet_notes", "subnet_notes", "apim_notes")
+                }
+                combined["summary_by_id"] = {
+                    **left["summary_by_id"],
+                    **right["summary_by_id"],
+                }
+                return combined
+            if retry_attempt < 3:
+                delay = retry_delay_seconds(error, retry_attempt)
+                print(
+                    "WARNING: Foundry token rate limit hit for one evidence "
+                    f"item; retrying in {delay:g}s "
+                    f"({retry_attempt + 1}/3).",
+                    file=sys.stderr,
+                )
+                time.sleep(delay)
+                return request_batch(batch, retry_attempt + 1)
+            raise RuntimeError(
+                "Foundry token rate limit persisted for a single evidence item "
+                "after three retries. Retry later or reduce the evidence fields."
+            ) from error
+
+        output_text = getattr(response, "output_text", None)
+        if not isinstance(output_text, str) or not output_text.strip():
+            raise RuntimeError("Foundry model returned no output text.")
+        try:
+            notes = json.loads(output_text)
+        except json.JSONDecodeError as error:
+            raise RuntimeError(
+                "Foundry model response was not valid JSON for the requested design notes."
+            ) from error
+        expected_keys = {
+            "vnet_notes",
+            "subnet_notes",
+            "apim_notes",
+            "resource_summaries",
+        }
+        if not isinstance(notes, dict) or set(notes) != expected_keys:
+            raise RuntimeError(
+                "Foundry model response must contain vnet_notes, subnet_notes, "
+                "apim_notes, and resource_summaries."
+            )
+        note_keys = {"vnet_notes", "subnet_notes", "apim_notes"}
+        if any(not isinstance(notes[key], str) for key in note_keys):
+            raise RuntimeError("Foundry model design-note values must all be strings.")
+        for key, category in (
+            ("vnet_notes", "vnets"),
+            ("subnet_notes", "subnets"),
+            ("apim_notes", "apim_services"),
+        ):
+            if not batch_evidence["network_design"][category] and notes[key].strip():
+                print(
+                    f"WARNING: Discarding {key} from this batch because it "
+                    "contained no matching evidence.",
+                    file=sys.stderr,
+                )
+                notes[key] = ""
+
+        summaries = notes["resource_summaries"]
+        if not isinstance(summaries, list):
+            raise RuntimeError("Foundry model resource_summaries must be a JSON array.")
+        summary_by_id = {}
+        for item in summaries:
+            if (
+                not isinstance(item, dict)
+                or set(item) != {"evidence_id", "summary"}
+                or not isinstance(item["evidence_id"], str)
+                or not isinstance(item["summary"], str)
+            ):
+                raise RuntimeError(
+                    "Each resource summary must contain string evidence_id and summary fields."
+                )
+            evidence_id = item["evidence_id"]
+            summary = " ".join(item["summary"].split())
+            if evidence_id not in expected_ids or evidence_id in summary_by_id:
+                raise RuntimeError(
+                    "Foundry model returned an unknown or duplicate resource evidence_id."
+                )
+            if not summary:
+                raise RuntimeError(
+                    f"Foundry model returned an empty summary for {evidence_id}."
+                )
+            summary_by_id[evidence_id] = summary
+        missing_summaries = expected_ids - set(summary_by_id)
+        if missing_summaries:
+            raise RuntimeError(
+                "Foundry model omitted resource summaries for evidence IDs: "
+                + ", ".join(sorted(missing_summaries))
+            )
+        notes["summary_by_id"] = summary_by_id
+        return notes
+
+    aggregated_notes = {
+        "vnet_notes": [],
+        "subnet_notes": [],
+        "apim_notes": [],
+    }
+    summary_by_id = {}
+    print(
+        f"Foundry enrichment: processing {len(batches)} sequential batch(es).",
+        file=sys.stderr,
+    )
+    try:
+        for batch_number, batch in enumerate(batches, start=1):
+            print(
+                f"Foundry enrichment: batch {batch_number}/{len(batches)} "
+                f"({len(batch)} evidence item(s)).",
+                file=sys.stderr,
+            )
+            batch_notes = request_batch(batch)
+            for key in aggregated_notes:
+                if batch_notes[key].strip():
+                    aggregated_notes[key].append(batch_notes[key].strip())
+            summary_by_id.update(batch_notes["summary_by_id"])
+    finally:
+        project_client.close()
+        credential.close()
+
+    resource_by_id = {
+        resource["evidence_id"]: resource for resource in resource_evidence
+    }
+    missing_summaries = set(resource_by_id) - set(summary_by_id)
+    if missing_summaries:
+        raise RuntimeError(
+            "Foundry model omitted resource summaries for evidence IDs: "
+            + ", ".join(sorted(missing_summaries))
+        )
+    result = {
+        key: "\n\n".join(values) for key, values in aggregated_notes.items()
+    }
+    result["resource_summaries"] = [
+        {**resource_by_id[evidence_id], "summary": summary_by_id[evidence_id]}
+        for evidence_id in resource_by_id
+    ]
+    return result
+
 
 AUTHOR = os.environ.get("HLD_AUTHOR", "Cloud4C")
 REVIEWER = os.environ.get("HLD_REVIEWER", "TBD")
@@ -1126,6 +1850,16 @@ def add_para(text="", style=None):
     p = doc.add_paragraph(style=style)
     p.add_run(str(text))
     return p
+
+
+def add_model_notes(heading, text):
+    if not isinstance(text, str) or not text.strip():
+        return
+    add_heading(heading, 3)
+    for paragraph in re.split(r"\n\s*\n", text.strip()):
+        if paragraph.strip():
+            add_para(paragraph.strip())
+
 
 def add_text_evidence(path, heading, level=2):
     if not path.exists():
@@ -1734,6 +2468,39 @@ def resource_alert_status(resource, alerts):
     return {"status": "Yes", "alert_groups": alert_groups} if any(items for _, items in alert_groups) else "No"
 
 subs = data.get("subscriptions", [])
+selected_subscription_ids = {
+    sid.strip().lower()
+    for sid in os.environ.get("SUBSCRIPTION_IDS", "").split(",")
+    if sid.strip()
+}
+if selected_subscription_ids:
+    available_ids = {
+        str(subscription.get("subscription_id", "")).lower()
+        for subscription in subs
+    }
+    missing_ids = selected_subscription_ids - available_ids
+    if missing_ids:
+        print(
+            "ERROR: SUBSCRIPTION_IDS contains subscriptions not found in "
+            f"{os.environ['INVENTORY']}: {', '.join(sorted(missing_ids))}",
+            file=sys.stderr
+        )
+        sys.exit(1)
+    subs = [
+        subscription
+        for subscription in subs
+        if str(subscription.get("subscription_id", "")).lower()
+        in selected_subscription_ids
+    ]
+
+model_enrichment_enabled = os.environ.get("MODEL_ENRICHMENT_ENABLED", "1")
+if model_enrichment_enabled not in {"0", "1"}:
+    raise ValueError("MODEL_ENRICHMENT_ENABLED must be either 0 or 1.")
+model_design_notes = (
+    invoke_network_design_agent(subs)
+    if model_enrichment_enabled == "1"
+    else {}
+)
 
 # ---------------------------------------------------------------------------
 # Use the uploaded document as the formatting baseline, but remove its
@@ -2394,6 +3161,39 @@ RESOURCE_CATALOG = {
             ]
 
         },
+        "apim_services": {
+
+            "title": "5.21 API Management Services",
+
+            "description": "API Management service inventory includes its Azure SKU/capacity, public network access setting and gateway endpoint as exposed by the control plane.",
+
+            "headers": [
+                "Service",
+                "Resource Group",
+                "Subscription",
+                "Region",
+                "SKU",
+                "Capacity",
+                "Public Network Access",
+                "Virtual Network Type",
+                "Gateway URL",
+                "Provisioning State"
+            ],
+
+            "mapper": lambda r,s: [
+                r.get("name", ""),
+                r.get("resourceGroup", r.get("resource_group", "")),
+                s.get("display_name", s.get("subscription_id", "")),
+                r.get("location", ""),
+                sku_value(r, "name"),
+                sku_value(r, "capacity"),
+                public_network_access(r) or "Not reported",
+                r.get("virtualNetworkType", (r.get("properties") or {}).get("virtualNetworkType", "")),
+                r.get("gatewayUrl", (r.get("properties") or {}).get("gatewayUrl", "")),
+                r.get("provisioningState", (r.get("properties") or {}).get("provisioningState", ""))
+            ]
+
+        },
         "application_gateways": generic_catalog_item("4.18 Application Gateways"),
         "firewalls": generic_catalog_item("4.19 Azure Firewalls"),
         "firewall_policies": generic_catalog_item("4.20 Firewall Policies"),
@@ -2488,6 +3288,7 @@ CATALOG_RESOURCE_GROUPS = {
         "data_factories",
         "service_bus",
         "event_hubs",
+        "apim_services",
         "logic_apps",
         "eventgrid_topics"
     },
@@ -2956,6 +3757,8 @@ for s in subs:
         ])
 add_table(["VNet","Subnet","Subscription","Address Prefix","NSG","Route Table","PE Policies"], sub_rows)
 add_caption("Table 9: Subnet Configuration")
+add_model_notes("4.3.2 VNet Design Notes", model_design_notes.get("vnet_notes", ""))
+add_model_notes("4.3.3 Subnet Design Notes", model_design_notes.get("subnet_notes", ""))
 
 add_heading("4.4 VNET Peering", 2)
 peer_rows=[]
@@ -3138,6 +3941,108 @@ for s in subs:
     add_caption(f"Virtual Machines: {s.get('display_name','')}")
 
 render_catalog_section("5. Compute And Storage")
+add_model_notes("5.22 API Management Design Notes", model_design_notes.get("apim_notes", ""))
+
+detected_nvas = {}
+for subscription in subs:
+    inventory_section = subscription.get("inventory", {})
+    for vm in inventory_section.get("vms", []) or []:
+        detection = vm.get("vendor_detection") or {}
+        vendor = detection.get("vendor", "Unknown")
+        if vendor not in ("", "Unknown"):
+            detected_nvas.setdefault(vendor, []).append((subscription, vm, detection))
+
+if detected_nvas:
+    add_heading("5.4 Vendor-Specific Network Virtual Appliances", 2)
+    add_para(
+        "Vendor identification uses Azure image/Marketplace metadata first, with VM names "
+        "and tags as medium-confidence evidence. These tables document Azure-side "
+        "network associations only; they do not represent appliance-internal configuration."
+    )
+    for vendor_index, (vendor, records) in enumerate(sorted(detected_nvas.items()), 1):
+        add_heading(f"5.4.{vendor_index} {vendor} Azure Topology", 3)
+        detection_rows = []
+        topology_rows = []
+        for subscription, vm, detection in records:
+            image = vm.get("image") or {}
+            image = image if isinstance(image, dict) else {}
+            plan = vm.get("marketplace_plan") or {}
+            plan = plan if isinstance(plan, dict) else {}
+            tags = vm.get("tags") or {}
+            tags = tags if isinstance(tags, dict) else {}
+            plan_text = " / ".join(
+                str(plan.get(key) or "")
+                for key in ("publisher", "product", "name")
+                if plan.get(key)
+            )
+            tags_text = "; ".join(
+                f"{key}={value}" for key, value in sorted(tags.items())
+            )
+            detection_rows.append([
+                vm.get("name", ""),
+                subscription.get("display_name", ""),
+                detection.get("detected_product", detection.get("product", vendor)),
+                detection.get("confidence", ""),
+                ", ".join(detection.get("detection_source", []) or []),
+                image.get("publisher", ""),
+                image.get("offer", ""),
+                image.get("sku", ""),
+                plan_text,
+                tags_text,
+            ])
+
+            inventory_section = subscription.get("inventory", {})
+            subnet_by_id = {
+                str(subnet.get("id") or "").lower(): subnet
+                for subnet in inventory_section.get("subnets", []) or []
+                if subnet.get("id")
+            }
+            for nic in vm.get("network_interfaces", []) or [{}]:
+                subnet_names = []
+                nsg_ids = [nic.get("nsg_id", "")]
+                route_table_ids = []
+                for subnet_id in nic.get("subnet_ids", []) or []:
+                    subnet = subnet_by_id.get(str(subnet_id).lower(), {})
+                    subnet_names.append(
+                        f"{subnet.get('vnet', '')}/{subnet.get('name', '')}".strip("/")
+                        or resource_name_from_id(subnet_id)
+                    )
+                    nsg_ids.append(subnet.get("nsg_id", ""))
+                    route_table_ids.append(subnet.get("route_table_id", ""))
+                topology_rows.append([
+                    vm.get("name", ""),
+                    subscription.get("display_name", ""),
+                    nic.get("name", ""),
+                    ", ".join(nic.get("private_ips", []) or []),
+                    ", ".join(subnet_names),
+                    ", ".join(sorted({
+                        resource_name_from_id(value) for value in nsg_ids if value
+                    })),
+                    ", ".join(sorted({
+                        resource_name_from_id(value) for value in route_table_ids if value
+                    })),
+                    ", ".join(
+                        resource_name_from_id(value)
+                        for value in nic.get("public_ip_ids", []) or []
+                    ),
+                ])
+        add_table(
+            [
+                "VM Name", "Subscription", "Detected Product", "Confidence",
+                "Detection Sources", "Image Publisher", "Image Offer", "Image SKU",
+                "Marketplace Plan", "Tags",
+            ],
+            detection_rows,
+        )
+        add_caption(f"{vendor} vendor detection evidence")
+        add_table(
+            [
+                "VM Name", "Subscription", "NIC", "Private IPs", "Subnet",
+                "NSG", "Route Table", "Public IP",
+            ],
+            topology_rows,
+        )
+        add_caption(f"{vendor} Azure-side topology")
 
 # ---------------------------------------------------------------------------
 # 6. IAM
@@ -3201,7 +4106,12 @@ add_para(
     "plan as enabled unless the corresponding control-plane data is collected."
 )
 
-render_catalog_section("9. AI Platform")
+if any(
+    (subscription.get("inventory") or {}).get("ai_resources")
+    for subscription in subs
+):
+    add_heading("9. AI Platform", 1)
+    render_catalog_section("9. AI Platform")
 
 # ---------------------------------------------------------------------------
 # 10. Monitor
@@ -3258,6 +4168,7 @@ network_resource_sets = [
     ("NSGs", "nsgs"),
     ("Azure Firewalls", "firewalls"),
     ("Application Gateways", "application_gateways"),
+    ("API Management Services", "apim_services"),
 ]
 for label, key in network_resource_sets:
     rows=[]
@@ -3420,12 +4331,45 @@ for s in subs:
         s.get("display_name",""),s.get("subscription_id",""),
         len(inv.get("resource_groups",[])),len(inv.get("vnets",[])),
         len(inv.get("vms",[])),len(inv.get("storage_accounts",[])),
-        len(inv.get("key_vaults",[])),len(inv.get("policy_assignments",[]))
+        len(inv.get("key_vaults",[])),len(inv.get("apim_services",[])),
+        len(inv.get("policy_assignments",[]))
     ])
-add_table(["Subscription","ID","RGs","VNets","VMs","Storage","Key Vaults","Policies"],summary_rows)
+add_table(["Subscription","ID","RGs","VNets","VMs","Storage","Key Vaults","APIM Services","Policies"],summary_rows)
 add_caption("Table 24: Subscription Summary")
 
-add_heading("12.2 Glossary of Terms", 2)
+resource_summary_rows = model_design_notes.get("resource_summaries", [])
+if resource_summary_rows:
+    add_heading("12.2 AI-Generated Resource Highlights", 2)
+    add_para(
+        "Summaries cover selected network components, virtual machines, databases, "
+        "and Azure AI resources using the collected evidence. They are intended as "
+        "a concise orientation, not as a compliance assessment or a substitute "
+        "for detailed resource configuration."
+    )
+    add_table(
+        [
+            "Resource Type",
+            "Name",
+            "Resource Group",
+            "Subscription",
+            "Region",
+            "AI-Generated Summary",
+        ],
+        [
+            [
+                resource.get("resource_type", ""),
+                resource.get("name", ""),
+                resource.get("resource_group", ""),
+                resource.get("subscription", ""),
+                resource.get("location", ""),
+                resource.get("summary", ""),
+            ]
+            for resource in resource_summary_rows
+        ],
+    )
+    add_caption("Table 25: AI-Generated Resource Highlights")
+
+add_heading("12.3 Glossary of Terms", 2)
 add_table(["Term","Definition"],[
     ["HLD","High Level Design"],
     ["VNet","Azure Virtual Network"],
@@ -3459,6 +4403,11 @@ for section in doc.sections:
 doc.save(str(output))
 print(f"Generated: {output}")
 PY
+python_status=$?
+if [[ "$python_status" -ne 0 ]]; then
+  echo "ERROR: HLD generation failed (Python exit code $python_status)." >&2
+  exit "$python_status"
+fi
 
 echo
 echo "=============================================================="
@@ -3467,5 +4416,3 @@ echo "Output: $OUTPUT"
 echo "Subscriptions discovered: $(python3 -c 'import json; print(len(json.load(open("'"$INVENTORY"'"))["subscriptions"]))')"
 echo "=============================================================="
 echo "Open the DOCX in Microsoft Word and allow the Table of Contents to update."
-
-
