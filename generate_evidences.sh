@@ -835,6 +835,19 @@ for idx, s in enumerate(subs, 1):
         ["resource", "list"],
         []
     )
+    resource_types = {
+        "aks_clusters": "microsoft.containerservice/managedclusters",
+        "aro_clusters": "microsoft.redhatopenshift/openshiftclusters",
+        "vm_scale_sets": "microsoft.compute/virtualmachinescalesets",
+    }
+    platform_resources = {
+        inventory_key: [
+            resource
+            for resource in all_resources
+            if str(resource.get("type", "")).lower() == resource_type
+        ]
+        for inventory_key, resource_type in resource_types.items()
+    }
 
     logic_app_standard = [
         r
@@ -1043,6 +1056,9 @@ Resources
         "peerings": peerings,
         "public_ips": pips,
         "vms": vm_rows,
+        "aks_clusters": platform_resources["aks_clusters"],
+        "aro_clusters": platform_resources["aro_clusters"],
+        "vm_scale_sets": platform_resources["vm_scale_sets"],
         "disks": disks,
         "storage_accounts": storage,
         "key_vaults": kvs,
@@ -1286,10 +1302,63 @@ def invoke_network_design_agent(subscriptions):
         "private_endpoints",
         "private_dns_zones",
         "network_watchers",
+        "aks_clusters",
+        "aro_clusters",
+        "vm_scale_sets",
         "sql_servers",
         "postgres_servers",
         "cosmos_accounts",
         "ai_resources",
+    }
+    platform_detail_fields = {
+        "aks_clusters": {
+            "provisioningState": None,
+            "kubernetesVersion": None,
+            "currentKubernetesVersion": None,
+            "powerState": None,
+            "enableRBAC": None,
+            "networkProfile": None,
+            "agentPoolProfiles": None,
+            "apiServerAccessProfile": None,
+            "oidcIssuerProfile": None,
+            "securityProfile": None,
+            "addonProfiles": None,
+            "autoUpgradeProfile": None,
+            "sku": None,
+            "azureMonitorProfile": None,
+            "workloadAutoScalerProfile": None,
+            "serviceMeshProfile": None,
+        },
+        "aro_clusters": {
+            "provisioningState": None,
+            "clusterProfile": {
+                "version": None,
+                "domain": None,
+                "resourceGroupId": None,
+                "fipsValidatedModules": None,
+            },
+            "networkProfile": None,
+            "masterProfile": None,
+            "workerProfiles": None,
+            "apiserverProfile": None,
+            "ingressProfiles": None,
+        },
+        "vm_scale_sets": {
+            "provisioningState": None,
+            "orchestrationMode": None,
+            "upgradePolicy": None,
+            "overprovision": None,
+            "singlePlacementGroup": None,
+            "platformFaultDomainCount": None,
+            "virtualMachineProfile": {
+                "storageProfile": None,
+                "networkProfile": None,
+                "priority": None,
+                "evictionPolicy": None,
+                "billingProfile": None,
+                "securityProfile": None,
+            },
+        },
     }
     summary_fields = (
         "sku",
@@ -1332,21 +1401,45 @@ def invoke_network_design_agent(subscriptions):
         "enablePurgeProtection",
     )
 
-    def compact_value(value, depth=0):
+    def compact_value(value, depth=0, max_depth=2):
         if isinstance(value, str):
             return value[:200]
         if isinstance(value, (bool, int, float)) or value is None:
             return value
-        if depth >= 2:
+        if depth >= max_depth:
             return str(value)[:200]
         if isinstance(value, dict):
             return {
-                str(key): compact_value(item, depth + 1)
+                str(key): compact_value(item, depth + 1, max_depth)
                 for key, item in list(value.items())[:10]
             }
         if isinstance(value, list):
-            return [compact_value(item, depth + 1) for item in value[:8]]
+            return [
+                compact_value(item, depth + 1, max_depth)
+                for item in value[:8]
+            ]
         return str(value)[:200]
+
+    def project_platform_properties(value, fields):
+        if isinstance(value, list):
+            return [
+                project_platform_properties(item, fields)
+                for item in value[:8]
+                if isinstance(item, (dict, list))
+            ]
+        if not isinstance(value, dict):
+            return compact_value(value, max_depth=4)
+        projected = {}
+        for field, nested_fields in fields.items():
+            if value.get(field) in (None, "", [], {}):
+                continue
+            item = value[field]
+            projected[field] = (
+                project_platform_properties(item, nested_fields)
+                if isinstance(nested_fields, dict)
+                else compact_value(item, max_depth=4)
+            )
+        return projected
 
     for subscription in subscriptions:
         inventory = subscription.get("inventory") or {}
@@ -1380,13 +1473,30 @@ def invoke_network_design_agent(subscriptions):
                         facts[field] = compact_value(resource[field])
                 properties = resource.get("properties")
                 if isinstance(properties, dict):
-                    safe_properties = {
-                        field: properties[field]
-                        for field in safe_property_fields
-                        if properties.get(field) not in (None, "", [], {})
-                    }
+                    detailed_fields = platform_detail_fields.get(resource_type)
+                    safe_properties = (
+                        project_platform_properties(properties, detailed_fields)
+                        if detailed_fields
+                        else {
+                            field: properties[field]
+                            for field in safe_property_fields
+                            if properties.get(field) not in (None, "", [], {})
+                        }
+                    )
                     if safe_properties:
-                        facts["properties"] = compact_value(safe_properties)
+                        facts["properties"] = compact_value(
+                            safe_properties,
+                            max_depth=4 if detailed_fields else 2,
+                        )
+                if resource_type in platform_detail_fields:
+                    facts["platform_detail_type"] = {
+                        "aks_clusters": "AKS",
+                        "aro_clusters": "ARO",
+                        "vm_scale_sets": "Virtual Machine Scale Set",
+                    }[resource_type]
+                    identity = resource.get("identity")
+                    if isinstance(identity, dict) and identity.get("type"):
+                        facts["identity_type"] = identity["type"]
                 resource_evidence.append(facts)
 
         for vnet in inventory.get("vnets", []) or []:
@@ -1566,10 +1676,15 @@ def invoke_network_design_agent(subscriptions):
         expected_ids = {
             resource["evidence_id"] for resource in batch_evidence["resources"]
         }
+        expected_platform_ids = {
+            resource["evidence_id"]
+            for resource in batch_evidence["resources"]
+            if resource.get("platform_detail_type")
+        }
         prompt = f"""
 Enrich the High Level Design with evidence-grounded design notes for Azure VNets,
-subnets, and API Management (APIM), and one-line summaries for the supplied
-resources.
+subnets, API Management (APIM), Azure Kubernetes Service (AKS), Azure Red Hat
+OpenShift (ARO), and Virtual Machine Scale Sets (VMSS).
 
 Use the Azure QC Control Library, Naming Standards, Tagging Standards, Policies,
 HLD and LLD available in your knowledge base as reference expectations where
@@ -1586,8 +1701,19 @@ Rules:
 - Write concise, practical HLD notes and call out material missing evidence.
 - Keep each note as plain-text paragraphs suitable for insertion into a Word HLD.
 - Label recommendations and required validations distinctly from observed facts.
+- For every supplied resource with "platform_detail_type", return a detailed
+  evidence-grounded analysis in "platform_analyses". Cover observed version/SKU
+  and provisioning state; topology and network integration; identity and access;
+  security posture; node-pool/scale/upgrade behavior where supplied; monitoring
+  and operational controls; and concrete validation gaps or recommendations.
+  Explicitly distinguish observations from recommendations. Mention "not
+  reported" rather than inferring omitted settings. Do not describe pod,
+  workload, or appliance internals that are not in Azure resource evidence.
+- Write platform analysis as useful HLD detail, normally 3-6 short sentences per
+  resource, and avoid repeating the resource summary verbatim.
 - Return exactly one JSON object with string properties "vnet_notes",
-  "subnet_notes", and "apim_notes", plus a "resource_summaries" array. Use an
+  "subnet_notes", and "apim_notes", plus "resource_summaries" and
+  "platform_analyses" arrays. Use an
   empty string for a category with no evidence in this batch. Include exactly
   one summary object for every supplied selected network, VM, database, or
   Azure AI resource in this batch's resource evidence,
@@ -1595,6 +1721,9 @@ Rules:
   evidence-grounded sentence (maximum 25 words), with no assumptions about
   unobserved configuration. Do not omit or duplicate resources. Do not include
   Markdown fences or any text outside the JSON object.
+  Each platform analysis object must contain exactly "evidence_id" and
+  "analysis" string fields, and cover every detailed platform resource in this
+  batch exactly once.
 
 Design evidence:
 {json.dumps(batch_evidence, ensure_ascii=False)}
@@ -1633,6 +1762,10 @@ Design evidence:
                     **left["summary_by_id"],
                     **right["summary_by_id"],
                 }
+                combined["analysis_by_id"] = {
+                    **left["analysis_by_id"],
+                    **right["analysis_by_id"],
+                }
                 return combined
             if retry_attempt < 3:
                 delay = retry_delay_seconds(error, retry_attempt)
@@ -1663,11 +1796,12 @@ Design evidence:
             "subnet_notes",
             "apim_notes",
             "resource_summaries",
+            "platform_analyses",
         }
         if not isinstance(notes, dict) or set(notes) != expected_keys:
             raise RuntimeError(
                 "Foundry model response must contain vnet_notes, subnet_notes, "
-                "apim_notes, and resource_summaries."
+                "apim_notes, resource_summaries, and platform_analyses."
             )
         note_keys = {"vnet_notes", "subnet_notes", "apim_notes"}
         if any(not isinstance(notes[key], str) for key in note_keys):
@@ -1689,6 +1823,7 @@ Design evidence:
         if not isinstance(summaries, list):
             raise RuntimeError("Foundry model resource_summaries must be a JSON array.")
         summary_by_id = {}
+        analysis_by_id = {}
         for item in summaries:
             if (
                 not isinstance(item, dict)
@@ -1717,6 +1852,39 @@ Design evidence:
                 + ", ".join(sorted(missing_summaries))
             )
         notes["summary_by_id"] = summary_by_id
+        platform_analyses = notes["platform_analyses"]
+        if not isinstance(platform_analyses, list):
+            raise RuntimeError("Foundry model platform_analyses must be a JSON array.")
+        analysis_by_id = {}
+        for item in platform_analyses:
+            if (
+                not isinstance(item, dict)
+                or set(item) != {"evidence_id", "analysis"}
+                or not isinstance(item["evidence_id"], str)
+                or not isinstance(item["analysis"], str)
+            ):
+                raise RuntimeError(
+                    "Each platform analysis must contain string evidence_id "
+                    "and analysis fields."
+                )
+            evidence_id = item["evidence_id"]
+            analysis = item["analysis"].strip()
+            if evidence_id not in expected_platform_ids or evidence_id in analysis_by_id:
+                raise RuntimeError(
+                    "Foundry model returned an unknown or duplicate platform evidence_id."
+                )
+            if not analysis:
+                raise RuntimeError(
+                    f"Foundry model returned an empty platform analysis for {evidence_id}."
+                )
+            analysis_by_id[evidence_id] = analysis
+        missing_analyses = expected_platform_ids - set(analysis_by_id)
+        if missing_analyses:
+            raise RuntimeError(
+                "Foundry model omitted detailed platform analyses for evidence IDs: "
+                + ", ".join(sorted(missing_analyses))
+            )
+        notes["analysis_by_id"] = analysis_by_id
         return notes
 
     aggregated_notes = {
@@ -1725,6 +1893,7 @@ Design evidence:
         "apim_notes": [],
     }
     summary_by_id = {}
+    analysis_by_id = {}
     print(
         f"Foundry enrichment: processing {len(batches)} sequential batch(es).",
         file=sys.stderr,
@@ -1741,6 +1910,7 @@ Design evidence:
                 if batch_notes[key].strip():
                     aggregated_notes[key].append(batch_notes[key].strip())
             summary_by_id.update(batch_notes["summary_by_id"])
+            analysis_by_id.update(batch_notes["analysis_by_id"])
     finally:
         project_client.close()
         credential.close()
@@ -1760,6 +1930,10 @@ Design evidence:
     result["resource_summaries"] = [
         {**resource_by_id[evidence_id], "summary": summary_by_id[evidence_id]}
         for evidence_id in resource_by_id
+    ]
+    result["platform_analyses"] = [
+        {**resource_by_id[evidence_id], "analysis": analysis_by_id[evidence_id]}
+        for evidence_id in analysis_by_id
     ]
     return result
 
@@ -3132,6 +3306,97 @@ RESOURCE_CATALOG = {
         "peerings": generic_catalog_item("4.16 VNet Peerings"),
         "public_ips": generic_catalog_item("4.17 Public IP Addresses"),
         "vms": generic_catalog_item("5.3 Virtual Machines"),
+        "aks_clusters": {
+            "title": "5.4 Azure Kubernetes Service Clusters",
+            "description": "AKS inventory is read from Azure Resource Manager and reports the Kubernetes version, SKU tier, provisioning state, and configured node pools. Workload-level Kubernetes state is not collected.",
+            "headers": [
+                "Cluster",
+                "Resource Group",
+                "Subscription",
+                "Region",
+                "Kubernetes Version",
+                "SKU Tier",
+                "Provisioning State",
+                "Node Pools",
+            ],
+            "mapper": lambda r, s: [
+                r.get("name", ""),
+                r.get("resourceGroup", ""),
+                s.get("display_name", s.get("subscription_id", "")),
+                r.get("location", ""),
+                (r.get("properties") or {}).get(
+                    "currentKubernetesVersion",
+                    (r.get("properties") or {}).get("kubernetesVersion", ""),
+                ),
+                ((r.get("properties") or {}).get("sku") or {}).get("tier", ""),
+                (r.get("properties") or {}).get("provisioningState", ""),
+                ", ".join(
+                    pool.get("name", "")
+                    for pool in (r.get("properties") or {}).get("agentPoolProfiles", [])
+                    if isinstance(pool, dict) and pool.get("name")
+                ),
+            ],
+        },
+        "aro_clusters": {
+            "title": "5.5 Azure Red Hat OpenShift Clusters",
+            "description": "ARO cluster inventory reports Azure control-plane properties only; it does not inspect OpenShift workloads or in-cluster configuration.",
+            "headers": [
+                "Cluster",
+                "Resource Group",
+                "Subscription",
+                "Region",
+                "OpenShift Version",
+                "Provisioning State",
+                "API Visibility",
+                "Worker Pools",
+            ],
+            "mapper": lambda r, s: [
+                r.get("name", ""),
+                r.get("resourceGroup", ""),
+                s.get("display_name", s.get("subscription_id", "")),
+                r.get("location", ""),
+                ((r.get("properties") or {}).get("clusterProfile") or {}).get(
+                    "version", ""
+                ),
+                (r.get("properties") or {}).get("provisioningState", ""),
+                ((r.get("properties") or {}).get("apiserverProfile") or {}).get(
+                    "visibility", ""
+                ),
+                ", ".join(
+                    pool.get("name", "")
+                    for pool in (r.get("properties") or {}).get("workerProfiles", [])
+                    if isinstance(pool, dict) and pool.get("name")
+                ),
+            ],
+        },
+        "vm_scale_sets": {
+            "title": "5.6 Virtual Machine Scale Sets",
+            "description": "VM Scale Set inventory reports model-level SKU, capacity, orchestration, upgrade, and provisioning settings exposed by Azure Resource Manager.",
+            "headers": [
+                "Scale Set",
+                "Resource Group",
+                "Subscription",
+                "Region",
+                "VM SKU",
+                "Capacity",
+                "Orchestration Mode",
+                "Upgrade Mode",
+                "Provisioning State",
+            ],
+            "mapper": lambda r, s: [
+                r.get("name", ""),
+                r.get("resourceGroup", ""),
+                s.get("display_name", s.get("subscription_id", "")),
+                r.get("location", ""),
+                (r.get("sku") or {}).get("name", ""),
+                (r.get("sku") or {}).get("capacity", ""),
+                (r.get("properties") or {}).get("orchestrationMode", ""),
+                ((r.get("properties") or {}).get("upgradePolicy") or {}).get(
+                    "mode", ""
+                ),
+                (r.get("properties") or {}).get("provisioningState", ""),
+            ],
+        },
         "key_vaults": {
 
             "title": "7.1 Key Vaults",
@@ -3282,6 +3547,9 @@ CATALOG_RESOURCE_GROUPS = {
         "container_apps",
         "container_app_environments",
         "container_registries",
+        "aks_clusters",
+        "aro_clusters",
+        "vm_scale_sets",
         "sql_servers",
         "postgres_servers",
         "cosmos_accounts",
@@ -3942,6 +4210,33 @@ for s in subs:
 
 render_catalog_section("5. Compute And Storage")
 add_model_notes("5.22 API Management Design Notes", model_design_notes.get("apim_notes", ""))
+
+platform_analysis_rows = model_design_notes.get("platform_analyses", [])
+if platform_analysis_rows:
+    add_heading("5.23 AKS, ARO, and VM Scale Set Design Analysis", 2)
+    add_para(
+        "The following analysis uses Azure Resource Manager evidence only. "
+        "It distinguishes observed configuration from recommendations and "
+        "validation items; it does not describe in-cluster workload state."
+    )
+    platform_names = {
+        "AKS": "Azure Kubernetes Service",
+        "ARO": "Azure Red Hat OpenShift",
+        "Virtual Machine Scale Set": "Virtual Machine Scale Set",
+    }
+    for platform in platform_analysis_rows:
+        platform_type = platform.get("platform_detail_type", "Platform")
+        resource_name = platform.get("name", "Unnamed resource")
+        subscription_name = platform.get("subscription", "")
+        heading = (
+            f"{platform_names.get(platform_type, platform_type)}: {resource_name}"
+        )
+        if subscription_name:
+            heading += f" ({subscription_name})"
+        add_heading(heading, 3)
+        for paragraph in re.split(r"\n\s*\n", platform.get("analysis", "").strip()):
+            if paragraph.strip():
+                add_para(paragraph.strip())
 
 detected_nvas = {}
 for subscription in subs:
