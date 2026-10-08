@@ -34,6 +34,7 @@
 #   FOUNDRY_MAX_INPUT_CHARS=9000 to set the serialized evidence batch size
 #   FOUNDRY_TRACING_ENABLED=0 to disable OpenTelemetry traces (enabled by default)
 #   FOUNDRY_OTEL_ENDPOINT=http://localhost:4318 for the OTLP HTTP collector
+#   AI_DEBUG_CITATIONS=1 to log rejected and available evidence citations
 #   MODEL_ENRICHMENT_ENABLED=0 to skip Foundry agent design-note enrichment
 #   AGENT_ENRICHMENT_ENABLED remains accepted as a legacy setting
 #   The script automatically loads ENV_FILE (default: ./.env) when present.
@@ -334,6 +335,43 @@ def az_for_sub(sid, args, default=None):
     return run(["az"] + args + ["--subscription", sid, "-o", "json"], default)
 
 
+def run_azure_cli_json(sid, args, setting_label):
+    try:
+        process = subprocess.run(
+            ["az"] + args + ["--subscription", sid, "-o", "json"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+    except OSError as error:
+        print(
+            f"WARNING: Unable to collect {setting_label} with Azure CLI: {error}",
+            file=sys.stderr,
+        )
+        return None
+
+    if process.returncode != 0:
+        print(
+            f"WARNING: Azure CLI could not collect {setting_label} "
+            f"(exit code {process.returncode}).",
+            file=sys.stderr,
+        )
+        return None
+    if not process.stdout.strip():
+        return None
+
+    try:
+        return json.loads(process.stdout)
+    except json.JSONDecodeError as error:
+        print(
+            f"WARNING: Azure CLI returned invalid JSON for {setting_label}: "
+            f"{error}",
+            file=sys.stderr,
+        )
+        return None
+
+
 def arg_query(sid, query):
 
     result = run(
@@ -435,21 +473,20 @@ def collect_diagnostic_settings(resource_id, subscription_id):
     if not resource_id:
         return []
 
-    result = run(
+    result = run_azure_cli_json(
+        subscription_id,
         [
-            "az",
             "monitor",
             "diagnostic-settings",
             "list",
             "--resource",
             resource_id,
-            "--subscription",
-            subscription_id,
-            "-o",
-            "json"
         ],
-        []
+        f"diagnostic settings for {resource_id}",
     )
+
+    if result is None:
+        return None
 
     if isinstance(result, dict):
         result = result.get("value", []) if isinstance(result.get("value"), list) else []
@@ -493,7 +530,21 @@ def collect_diagnostic_settings(resource_id, subscription_id):
                 or item.get("marketplacePartnerId")
                 or item.get("partnerSolutionId")
             ),
-            "destinations": sorted(set(destinations))
+            "destinations": sorted(set(destinations)),
+            "enabledLogCategories": sorted({
+                str(log.get("category", ""))
+                for log in item.get("logs", []) or []
+                if isinstance(log, dict)
+                and log.get("enabled")
+                and log.get("category")
+            }),
+            "enabledLogCategoryGroups": sorted({
+                str(log.get("categoryGroup", ""))
+                for log in item.get("logs", []) or []
+                if isinstance(log, dict)
+                and log.get("enabled")
+                and log.get("categoryGroup")
+            }),
         })
 
     if settings:
@@ -504,8 +555,171 @@ def collect_diagnostic_settings(resource_id, subscription_id):
         "resourceName": resource_name,
         "resourceType": "",
         "diagnosticsEnabled": False,
-        "destinations": []
+        "destinations": [],
+        "enabledLogCategories": [],
+        "enabledLogCategoryGroups": [],
     }]
+
+
+def sql_setting_state(value):
+    if value is True:
+        return "Enabled"
+    if value is False:
+        return "Disabled"
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"enabled", "disabled"}:
+            return normalized.title()
+    return "Not reported"
+
+
+def collect_sql_server_security(sid, server, diagnostic_settings):
+    server_name = str(server.get("name", ""))
+    resource_group = str(server.get("resourceGroup", ""))
+    if not server_name or not resource_group:
+        print(
+            "WARNING: SQL Server Entra and auditing settings were not queried "
+            "because the server name or resource group was missing.",
+            file=sys.stderr,
+        )
+        entra_admins = None
+        entra_only = None
+        audit_policy = None
+    else:
+        entra_admins = run_azure_cli_json(
+            sid,
+            [
+                "sql",
+                "server",
+                "ad-admin",
+                "list",
+                "--resource-group",
+                resource_group,
+                "--server",
+                server_name,
+            ],
+            f"Microsoft Entra administrator for SQL Server {server_name}",
+        )
+        entra_only = run_azure_cli_json(
+            sid,
+            [
+                "sql",
+                "server",
+                "ad-only-auth",
+                "get",
+                "--resource-group",
+                resource_group,
+                "--name",
+                server_name,
+            ],
+            f"Entra-only authentication for SQL Server {server_name}",
+        )
+        audit_policy = run_azure_cli_json(
+            sid,
+            [
+                "sql",
+                "server",
+                "audit-policy",
+                "show",
+                "--resource-group",
+                resource_group,
+                "--name",
+                server_name,
+            ],
+            f"auditing policy for SQL Server {server_name}",
+        )
+
+    if isinstance(entra_admins, list):
+        entra_admin_state = (
+            "Configured" if entra_admins else "Not configured"
+        )
+        entra_admin_count = len(entra_admins)
+    else:
+        entra_admin_state = "Not reported"
+        entra_admin_count = "Not reported"
+
+    entra_only_properties = (
+        entra_only.get("properties", {})
+        if isinstance(entra_only, dict)
+        else {}
+    )
+    if isinstance(entra_only, dict):
+        entra_only_value = entra_only.get(
+            "azureADOnlyAuthentication",
+            entra_only_properties.get(
+                "azureADOnlyAuthentication",
+                entra_only.get(
+                    "azureAdOnlyAuthentication",
+                    entra_only_properties.get("azureAdOnlyAuthentication"),
+                ),
+            ),
+        )
+    else:
+        entra_only_value = None
+
+    audit_properties = (
+        audit_policy.get("properties", {})
+        if isinstance(audit_policy, dict)
+        else {}
+    )
+    policy_state = (
+        audit_policy.get("state", audit_properties.get("state"))
+        if isinstance(audit_policy, dict)
+        else None
+    )
+    audit_destinations = set()
+    if isinstance(audit_policy, dict):
+        if (
+            audit_policy.get("storageEndpoint")
+            or audit_properties.get("storageEndpoint")
+        ):
+            audit_destinations.add("Storage")
+        if (
+            audit_policy.get("isAzureMonitorTargetEnabled")
+            or audit_properties.get("isAzureMonitorTargetEnabled")
+        ):
+            audit_destinations.add("Azure Monitor")
+        if (
+            audit_policy.get("eventHubAuthorizationRuleId")
+            or audit_properties.get("eventHubAuthorizationRuleId")
+        ):
+            audit_destinations.add("Event Hubs")
+
+    resource_id = str(server.get("id", "")).lower()
+    server_diagnostics = diagnostic_settings or []
+    audit_categories = sorted({
+        category
+        for setting in server_diagnostics
+        for category in setting.get("enabledLogCategories", [])
+        if "audit" in category.lower()
+    })
+    audit_category_groups = sorted({
+        category
+        for setting in server_diagnostics
+        for category in setting.get("enabledLogCategoryGroups", [])
+        if "audit" in category.lower()
+    })
+    if audit_categories or audit_category_groups:
+        for setting in server_diagnostics:
+            audit_destinations.update(setting.get("destinations", []))
+
+    if diagnostic_settings is None:
+        audit_diagnostic_state = "Not reported"
+    elif audit_categories or audit_category_groups:
+        audit_diagnostic_state = "Configured"
+    else:
+        audit_diagnostic_state = "Not configured"
+
+    return {
+        "entraAdministrator": entra_admin_state,
+        "entraAdministratorCount": entra_admin_count,
+        "entraOnlyAuthentication": sql_setting_state(entra_only_value),
+        "auditingPolicy": sql_setting_state(policy_state),
+        "auditLogCategories": audit_categories,
+        "auditLogCategoryGroups": audit_category_groups,
+        "auditLogDestinations": sorted(audit_destinations),
+        "auditDiagnosticSettings": audit_diagnostic_state,
+    }
 
 
 def arg_key_vaults_for_sub(sid):
@@ -713,6 +927,12 @@ for idx, s in enumerate(subs, 1):
         []
     )
 
+    mysql_servers = az_for_sub(
+        sid,
+        ["mysql","flexible-server","list"],
+        []
+    )
+
     cosmos_accounts = az_for_sub(
         sid,
         ["cosmosdb","list"],
@@ -842,6 +1062,31 @@ for idx, s in enumerate(subs, 1):
         ["resource", "list"],
         []
     )
+    sql_databases = []
+    for resource in all_resources:
+        if str(resource.get("type", "")).lower() != (
+            "microsoft.sql/servers/databases"
+        ):
+            continue
+        database_name = str(resource.get("name", "")).rsplit("/", 1)[-1]
+        if database_name.lower() == "master":
+            continue
+        resource_id_parts = str(resource.get("id", "")).rstrip("/").split("/")
+        resource["serverName"] = next(
+            (
+                resource_id_parts[index + 1]
+                for index, part in enumerate(resource_id_parts[:-1])
+                if part.lower() == "servers"
+            ),
+            "",
+        )
+        sql_databases.append(resource)
+    sql_managed_instances = [
+        resource
+        for resource in all_resources
+        if str(resource.get("type", "")).lower()
+        == "microsoft.sql/managedinstances"
+    ]
     resource_types = {
         "aks_clusters": "microsoft.containerservice/managedclusters",
         "aro_clusters": "microsoft.redhatopenshift/openshiftclusters",
@@ -1038,6 +1283,7 @@ Resources
             })
 
     diagnostic_settings = []
+    diagnostic_settings_by_resource_id = {}
     for resource_set in (
         vm_rows,
         storage,
@@ -1048,11 +1294,30 @@ Resources
         load_balancers,
         afd_profiles,
         apim_services,
+        sql_servers,
     ):
         for resource in resource_set or []:
             resource_id = resource.get("id") or resource.get("resourceId")
             if resource_id:
-                diagnostic_settings.extend(collect_diagnostic_settings(resource_id, sid))
+                collected_settings = collect_diagnostic_settings(resource_id, sid)
+                if collected_settings is None:
+                    diagnostic_settings_by_resource_id[
+                        str(resource_id).lower()
+                    ] = None
+                else:
+                    diagnostic_settings.extend(collected_settings)
+                    diagnostic_settings_by_resource_id[
+                        str(resource_id).lower()
+                    ] = collected_settings
+
+    for sql_server in sql_servers or []:
+        sql_server["security_review"] = collect_sql_server_security(
+            sid,
+            sql_server,
+            diagnostic_settings_by_resource_id.get(
+                str(sql_server.get("id", "")).lower()
+            ),
+        )
 
     s["inventory"] = {
         "resource_groups": rgs,
@@ -1087,7 +1352,10 @@ Resources
         "container_app_environments": container_envs,
         "container_registries": container_registries,
         "sql_servers": sql_servers,
+        "sql_databases": sql_databases,
+        "sql_managed_instances": sql_managed_instances,
         "postgres_servers": postgres_servers,
+        "mysql_servers": mysql_servers,
         "cosmos_accounts": cosmos_accounts,
         "data_factories": data_factories,
         "service_bus": service_bus,
@@ -1338,6 +1606,7 @@ def invoke_network_design_agent(subscriptions):
         "private_dns_zones",
         "network_watchers",
         "bastions",
+        "app_service_plans",
     }
     architecture_inventory_types = {
         "vms",
@@ -1352,7 +1621,10 @@ def invoke_network_design_agent(subscriptions):
         "vm_scale_sets",
         "apim_services",
         "sql_servers",
+        "sql_databases",
+        "sql_managed_instances",
         "postgres_servers",
+        "mysql_servers",
         "cosmos_accounts",
         "ai_resources",
         "app_services",
@@ -1363,6 +1635,21 @@ def invoke_network_design_agent(subscriptions):
         "event_hubs",
         "storage_accounts",
         "key_vaults",
+    }
+    well_architected_inventory_types = {
+        "vms",
+        "aks_clusters",
+        "aro_clusters",
+        "vm_scale_sets",
+        "sql_servers",
+        "sql_databases",
+        "sql_managed_instances",
+        "postgres_servers",
+        "mysql_servers",
+        "cosmos_accounts",
+        "app_services",
+        "function_apps",
+        "apim_services",
     }
     context_by_id = {}
     platform_detail_fields = {
@@ -1494,6 +1781,7 @@ def invoke_network_design_agent(subscriptions):
         "size",
         "image",
         "marketplace_plan",
+        "security_review",
         "vendor_detection",
         "network_interfaces",
         "public_access",
@@ -1504,6 +1792,29 @@ def invoke_network_design_agent(subscriptions):
         "accessTier",
         "minimumTlsVersion",
         "httpsOnly",
+        "version",
+        "backup",
+        "highAvailability",
+        "storage",
+        "network",
+        "zoneRedundant",
+        "maxSizeBytes",
+        "readScale",
+        "autoPauseDelay",
+        "serverName",
+        "serverFarmId",
+        "zone",
+        "zones",
+        "locations",
+        "consistencyPolicy",
+        "backupPolicy",
+        "enableAutomaticFailover",
+        "enableMultipleWriteLocations",
+        "isVirtualNetworkFilterEnabled",
+        "virtualNetworkRules",
+        "disableLocalAuth",
+        "workerTier",
+        "status",
     )
     safe_property_fields = (
         "provisioningState",
@@ -1523,6 +1834,29 @@ def invoke_network_design_agent(subscriptions):
         "enableSoftDelete",
         "enablePurgeProtection",
         "identity",
+        "version",
+        "backup",
+        "highAvailability",
+        "storage",
+        "network",
+        "zoneRedundant",
+        "maxSizeBytes",
+        "readScale",
+        "autoPauseDelay",
+        "serverName",
+        "serverFarmId",
+        "zone",
+        "zones",
+        "locations",
+        "consistencyPolicy",
+        "backupPolicy",
+        "enableAutomaticFailover",
+        "enableMultipleWriteLocations",
+        "isVirtualNetworkFilterEnabled",
+        "virtualNetworkRules",
+        "disableLocalAuth",
+        "workerTier",
+        "status",
     )
 
     sensitive_key_pattern = re.compile(
@@ -1623,6 +1957,7 @@ def invoke_network_design_agent(subscriptions):
                                 "network_interfaces",
                                 "vendor_detection",
                                 "marketplace_plan",
+                                "security_review",
                             ) else 2,
                         )
                 properties = resource.get("properties")
@@ -1715,6 +2050,11 @@ def invoke_network_design_agent(subscriptions):
                 "resource_group": apim.get("resourceGroup", ""),
                 "location": apim.get("location", ""),
                 "sku": apim.get("sku") or {},
+                "capacity": (apim.get("sku") or {}).get("capacity"),
+                "provisioning_state": (
+                    apim.get("provisioningState")
+                    or properties.get("provisioningState")
+                ),
                 "public_network_access": (
                     apim.get("publicNetworkAccess")
                     or properties.get("publicNetworkAccess")
@@ -2094,7 +2434,20 @@ strict JSON object matching this response contract:
     }}],
     "architecture_observations": ["string"],
     "recommendations": ["string"],
-    "required_validation": ["string"]
+    "required_validation": ["string"],
+    "well_architected_assessment": [{{
+      "pillar": "Reliability | Security | Cost Optimization | Operational Excellence | Performance Efficiency",
+      "observed": "concise Azure-inventory observation",
+      "recommendation": "evidence-grounded action",
+      "required_validation": "specific follow-up check",
+      "priority": "High | Medium | Low | Informational",
+      "evidence": [{{
+        "attribute": "string",
+        "value": "string",
+        "source": "azure_inventory",
+        "evidence": "specific supplied fact"
+      }}]
+    }}]
   }}],
   "architecture_summary": {{
     "network_architecture": ["string"],
@@ -2116,6 +2469,49 @@ supported by supplied IDs or explicit associations. Confidence must be numeric
 between 0 and 1. Use empty strings/arrays when the evidence does not support a
 conclusion. The network note string must be empty when its evidence array is
 empty. Do not include Markdown fences or text outside the JSON object.
+
+Provide a concise Well-Architected Review for every resource whose
+"inventory_key" is one of: vms, aks_clusters, aro_clusters, vm_scale_sets,
+sql_servers, sql_databases, sql_managed_instances, postgres_servers,
+mysql_servers, cosmos_accounts,
+app_services, function_apps, or apim_services. Use only relevant pillars:
+Reliability, Security, Cost Optimization, Operational Excellence, and
+Performance Efficiency. Return one or more assessment rows per such resource;
+return an empty assessment array for other resource types. Return no more than
+three concise, high-value rows per resource; do not create boilerplate rows
+for all five pillars. Each row must cite one or
+more exact facts already listed in that classification's "evidence". The
+"observed" field states only what the inventory reports; the recommendation
+and validation must be concise and actionable. If a setting needed for an
+assessment is not reported, state that it is not reported and ask for the
+specific validation instead of judging compliance. Do not calculate a
+Well-Architected score or claim the resource passes/fails a pillar.
+"priority" is review urgency only, not a compliance verdict; use Informational
+for missing evidence unless a material issue is directly observed. Keep each
+assessment to one pillar and avoid duplicating the general observations,
+recommendations, or required_validation arrays.
+
+Evidence citations may reference a scalar field nested in a supplied resource
+object using a dotted attribute path such as "sku.capacity". Cite the exact
+scalar value from the supplied inventory, even if the classification evidence
+also summarizes its parent object as a combined value.
+
+For every sql_servers resource, include Security review coverage for the
+reported publicNetworkAccess value, Microsoft Entra administrator configuration
+and Entra-only authentication as separate facts, plus the SQL auditing policy,
+enabled audit diagnostic categories and destinations. Explain that an Entra
+administrator being configured does not prove SQL authentication is disabled;
+review the Entra-only authentication setting separately. If any of these values
+are "Not reported", request validation instead of inferring a state. Keep these
+checks concise and within the three-row limit.
+
+Review focus by resource: AKS/ARO/VMSS reliability, security, scaling/cost,
+upgrade/operations and performance from their collected Azure properties;
+VM image/size/network/public exposure/availability evidence; SQL/PostgreSQL/
+MySQL/Cosmos data-service SKU, network exposure, availability/backup/version
+properties when supplied; App Service/Functions plan, SKU, state, HTTPS and
+network evidence; APIM SKU/capacity, network exposure, gateway and provisioning
+evidence. A missing property is a validation gap, not proof of a misconfiguration.
 
 Design evidence:
 {json.dumps(batch_evidence, ensure_ascii=False)}
@@ -2277,6 +2673,20 @@ Design evidence:
             "architecture_observations",
             "recommendations",
             "required_validation",
+            "well_architected_assessment",
+        }
+        allowed_well_architected_pillars = {
+            "Reliability",
+            "Security",
+            "Cost Optimization",
+            "Operational Excellence",
+            "Performance Efficiency",
+        }
+        allowed_review_priorities = {
+            "High",
+            "Medium",
+            "Low",
+            "Informational",
         }
         classification_by_id = {}
         for item in classifications:
@@ -2361,6 +2771,175 @@ Design evidence:
                         "azure_inventory facts."
                     )
                 validated_evidence.append(citation)
+
+            def match_validated_citation(citation):
+                if (
+                    not isinstance(citation, dict)
+                    or set(citation) != {"attribute", "value", "source", "evidence"}
+                    or not all(
+                        isinstance(citation[field], str)
+                        for field in ("attribute", "value", "source", "evidence")
+                    )
+                    or not citation["attribute"].strip()
+                    or not citation["evidence"].strip()
+                    or citation["source"] != "azure_inventory"
+                ):
+                    raise RuntimeError(
+                        "Well-Architected assessment citations must identify "
+                        "azure_inventory facts."
+                    )
+
+                for validated_citation in validated_evidence:
+                    if (
+                        validated_citation["attribute"].strip().casefold()
+                        == citation["attribute"].strip().casefold()
+                        and validated_citation["value"].strip()
+                        == citation["value"].strip()
+                        and validated_citation["source"] == citation["source"]
+                    ):
+                        return validated_citation
+
+                attribute_parts = [
+                    part.strip().casefold()
+                    for part in citation["attribute"].split(".")
+                    if part.strip()
+                ]
+                observed_value = resource
+                for attribute_part in attribute_parts:
+                    if not isinstance(observed_value, dict):
+                        observed_value = None
+                        break
+                    matching_key = next(
+                        (
+                            key
+                            for key in observed_value
+                            if str(key).casefold() == attribute_part
+                        ),
+                        None,
+                    )
+                    if matching_key is None:
+                        observed_value = None
+                        break
+                    observed_value = observed_value[matching_key]
+
+                if (
+                    attribute_parts
+                    and isinstance(observed_value, (str, int, float, bool))
+                    and str(observed_value).strip() == citation["value"].strip()
+                ):
+                    return {
+                        "attribute": citation["attribute"],
+                        "value": str(observed_value),
+                        "source": "azure_inventory",
+                        "evidence": (
+                            f"{citation['attribute']}={observed_value} "
+                            "from supplied Azure inventory"
+                        ),
+                    }
+                if os.environ.get("AI_DEBUG_CITATIONS", "").strip().lower() in {
+                    "1",
+                    "true",
+                    "yes",
+                }:
+                    print(
+                        "[AI] CITATION DEBUG: "
+                        + json.dumps(
+                            {
+                                "request": request_label,
+                                "resource_id": resource.get("resource_id", ""),
+                                "rejected_citation": citation,
+                                "validated_citations": [
+                                    {
+                                        "attribute": item["attribute"],
+                                        "value": item["value"],
+                                        "source": item["source"],
+                                    }
+                                    for item in validated_evidence
+                                ],
+                            },
+                            ensure_ascii=False,
+                        ),
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                raise RuntimeError(
+                    "Well-Architected assessment citations must reference an "
+                    "attribute and value in the resource's validated evidence."
+                )
+
+            assessments = item["well_architected_assessment"]
+            if not isinstance(assessments, list):
+                raise RuntimeError(
+                    "Foundry Agent well_architected_assessment must be an array."
+                )
+            if (
+                resource.get("inventory_key") in well_architected_inventory_types
+                and not assessments
+            ):
+                raise RuntimeError(
+                    "Foundry Agent omitted the Well-Architected Review for "
+                    f"{resource.get('inventory_key')} resource "
+                    f"{resource['resource_id']}."
+                )
+            if (
+                resource.get("inventory_key") not in well_architected_inventory_types
+                and assessments
+            ):
+                raise RuntimeError(
+                    "Foundry Agent returned an out-of-scope Well-Architected "
+                    f"Review for {resource.get('inventory_key')} resource "
+                    f"{resource['resource_id']}."
+                )
+            if len(assessments) > 3:
+                raise RuntimeError(
+                    "Foundry Agent returned more than three Well-Architected "
+                    f"rows for {resource.get('inventory_key')} resource "
+                    f"{resource['resource_id']}."
+                )
+            validated_assessments = []
+            for assessment in assessments:
+                if (
+                    not isinstance(assessment, dict)
+                    or set(assessment)
+                    != {
+                        "pillar",
+                        "observed",
+                        "recommendation",
+                        "required_validation",
+                        "priority",
+                        "evidence",
+                    }
+                    or not all(
+                        isinstance(assessment[field], str)
+                        for field in (
+                            "pillar",
+                            "observed",
+                            "recommendation",
+                            "required_validation",
+                            "priority",
+                        )
+                    )
+                    or assessment["pillar"] not in allowed_well_architected_pillars
+                    or assessment["priority"] not in allowed_review_priorities
+                    or not assessment["observed"].strip()
+                    or not assessment["recommendation"].strip()
+                    or not assessment["required_validation"].strip()
+                    or not isinstance(assessment["evidence"], list)
+                    or not assessment["evidence"]
+                ):
+                    raise RuntimeError(
+                        "Foundry Agent returned a malformed Well-Architected "
+                        "assessment row."
+                    )
+                assessment_evidence = []
+                for citation in assessment["evidence"]:
+                    assessment_evidence.append(
+                        match_validated_citation(citation)
+                    )
+                validated_assessments.append({
+                    **assessment,
+                    "evidence": assessment_evidence,
+                })
             if not isinstance(item["relationships"], list):
                 raise RuntimeError("Foundry Agent relationships must be a JSON array.")
             validated_relationships = []
@@ -2406,6 +2985,7 @@ Design evidence:
                 "azure_resource_type": resource["azure_type"],
                 "evidence": validated_evidence,
                 "relationships": validated_relationships,
+                "well_architected_assessment": validated_assessments,
                 "confidence": float(confidence),
                 "evidence_id": resource["evidence_id"],
                 "resource_type": resource["resource_type"],
@@ -2454,10 +3034,15 @@ Design evidence:
         relationship_count = sum(
             len(item["relationships"]) for item in classification_by_id.values()
         )
+        well_architected_count = sum(
+            len(item["well_architected_assessment"])
+            for item in classification_by_id.values()
+        )
         ai_log(
             f"VALIDATED {request_label}: classifications="
             f"{len(classification_by_id)}/{len(expected_resources)}, "
             f"citations={citation_count}, relationships={relationship_count}, "
+            f"well_architected_rows={well_architected_count}, "
             f"findings={len(notes['findings'])}; schema and inventory references passed."
         )
         notes["classification_by_id"] = classification_by_id
@@ -4139,8 +4724,65 @@ RESOURCE_CATALOG = {
         },
         "container_app_environments": generic_catalog_item("5.11 Container App Environments"),
         "container_registries": generic_catalog_item("5.12 Container Registries"),
-        "sql_servers": generic_catalog_item("5.13 SQL Servers"),
+        "sql_servers": {
+            "title": "5.13 SQL Servers",
+            "description": (
+                "Azure SQL logical-server inventory reports public network "
+                "access, Microsoft Entra administrator and Entra-only "
+                "authentication settings, and auditing policy and diagnostic "
+                "log configuration. Configured audit routing does not prove "
+                "that audit events are being received or retained."
+            ),
+            "headers": [
+                "SQL Server",
+                "Resource Group",
+                "Subscription",
+                "Region",
+                "Public Network Access",
+                "Entra Administrator",
+                "Entra-only Authentication",
+                "Auditing Policy",
+                "Audit Diagnostic Settings",
+                "Audit Log Categories",
+                "Audit Destinations",
+            ],
+            "mapper": lambda r, s: [
+                r.get("name", ""),
+                r.get("resourceGroup", r.get("resource_group", "")),
+                s.get("display_name", s.get("subscription_id", "")),
+                r.get("location", ""),
+                public_network_access(r) or "Not reported",
+                (r.get("security_review") or {}).get(
+                    "entraAdministrator", "Not reported"
+                ),
+                (r.get("security_review") or {}).get(
+                    "entraOnlyAuthentication", "Not reported"
+                ),
+                (r.get("security_review") or {}).get(
+                    "auditingPolicy", "Not reported"
+                ),
+                (r.get("security_review") or {}).get(
+                    "auditDiagnosticSettings", "Not reported"
+                ),
+                ", ".join(
+                    (r.get("security_review") or {}).get(
+                        "auditLogCategories", []
+                    )
+                    + (r.get("security_review") or {}).get(
+                        "auditLogCategoryGroups", []
+                    )
+                ) or "Not reported",
+                ", ".join(
+                    (r.get("security_review") or {}).get(
+                        "auditLogDestinations", []
+                    )
+                ) or "Not reported",
+            ],
+        },
+        "sql_databases": generic_catalog_item("Azure SQL Databases"),
+        "sql_managed_instances": generic_catalog_item("Azure SQL Managed Instances"),
         "postgres_servers": generic_catalog_item("5.14 PostgreSQL Servers"),
+        "mysql_servers": generic_catalog_item("MySQL Flexible Servers"),
         "cosmos_accounts": generic_catalog_item("5.15 Cosmos DB Accounts"),
         "data_factories": generic_catalog_item("5.16 Data Factories"),
         "service_bus": generic_catalog_item("5.17 Service Bus Namespaces"),
@@ -4185,7 +4827,10 @@ CATALOG_RESOURCE_GROUPS = {
         "aro_clusters",
         "vm_scale_sets",
         "sql_servers",
+        "sql_databases",
+        "sql_managed_instances",
         "postgres_servers",
+        "mysql_servers",
         "cosmos_accounts",
         "data_factories",
         "service_bus",
@@ -4846,76 +5491,9 @@ render_catalog_section("5. Compute And Storage")
 add_model_notes("5.22 API Management Design Notes", model_design_notes.get("apim_notes", ""))
 
 resource_classifications = model_design_notes.get("resource_classifications", [])
-platform_analysis_rows = [
-    resource
-    for resource in resource_classifications
-    if resource.get("platform_detail_type")
-]
-if platform_analysis_rows:
-    add_heading("5.23 AKS, ARO, and VM Scale Set Design Analysis", 2)
-    platform_names = {
-        "AKS": "Azure Kubernetes Service",
-        "ARO": "Azure Red Hat OpenShift",
-        "Virtual Machine Scale Set": "Virtual Machine Scale Set",
-    }
-
-    def platform_analysis_cell(values):
-        entries = [
-            str(value).strip()
-            for value in values
-            if isinstance(value, str) and value.strip()
-        ]
-        return entries or ["Not provided by Agent"]
-
-    add_table(
-        [
-            "Platform / Resource",
-            "Observed",
-            "Recommendation",
-            "Required Validation",
-            "Relationships",
-        ],
-        [
-            [
-                " | ".join(
-                    value
-                    for value in (
-                        platform_names.get(
-                            platform.get("platform_detail_type", ""),
-                            platform.get("platform_detail_type", "Platform"),
-                        ),
-                        platform.get("resource_name", ""),
-                        platform.get("subscription", ""),
-                    )
-                    if value
-                ),
-                platform_analysis_cell(
-                    platform.get("architecture_observations", [])
-                ),
-                platform_analysis_cell(platform.get("recommendations", [])),
-                platform_analysis_cell(platform.get("required_validation", [])),
-                platform_analysis_cell([
-                    " | ".join(
-                        value
-                        for value in (
-                            relationship.get("relationship", ""),
-                            relationship.get("target_resource", ""),
-                            relationship.get("purpose", ""),
-                        )
-                        if value
-                    )
-                    for relationship in platform.get("relationships", [])
-                    if isinstance(relationship, dict)
-                ]),
-            ]
-            for platform in platform_analysis_rows
-        ],
-    )
-    add_caption("Table: AKS, ARO, and VM Scale Set Architecture Analysis")
-
 architecture_summary = model_design_notes.get("architecture_summary", {})
 if any(architecture_summary.values()):
-    add_heading("5.24 Agent Architecture Summary", 2)
+    add_heading("5.23 Agent Architecture Summary", 2)
     for category, heading in (
         ("network_architecture", "Network Architecture"),
         ("security_architecture", "Security Architecture"),
@@ -4929,9 +5507,64 @@ if any(architecture_summary.values()):
             add_bullets(entries)
 
 agent_findings = model_design_notes.get("findings", [])
-if agent_findings:
-    add_heading("5.25 Agent Findings and Required Review", 2)
-    add_bullets(agent_findings)
+well_architected_rows = []
+for resource in resource_classifications:
+    for assessment in resource.get("well_architected_assessment", []):
+        citations = assessment.get("evidence", [])
+        observed = [assessment.get("observed", "")]
+        observed.extend(
+            f"Evidence: {citation.get('attribute', '')}="
+            f"{citation.get('value', '')}"
+            for citation in citations
+        )
+        resource_details = [
+            resource.get("resource_type", ""),
+            resource.get("resource_name", ""),
+            resource.get("resource_group", ""),
+            resource.get("subscription", ""),
+        ]
+        well_architected_rows.append([
+            [value for value in resource_details if value],
+            assessment.get("pillar", ""),
+            [value for value in observed if value],
+            assessment.get("recommendation", ""),
+            assessment.get("required_validation", ""),
+            assessment.get("priority", ""),
+        ])
+
+if agent_findings or well_architected_rows:
+    add_heading("5.24 Agent Findings and Well-Architected Review", 2)
+    add_para(
+        "Review is based only on collected Azure control-plane evidence. "
+        "It is not a formal Well-Architected assessment or compliance score. "
+        "Items marked for validation identify information not established by "
+        "the current inventory."
+    )
+    if well_architected_rows:
+        add_table(
+            [
+                "Resource / Scope",
+                "Pillar",
+                "Observed / Evidence",
+                "Recommendation",
+                "Required Validation",
+                "Review Priority",
+            ],
+            well_architected_rows,
+        )
+        add_caption(
+            "Table: Resource-Level Well-Architected Review "
+            "(VMs, AKS, ARO, VMSS, databases, apps, Functions and APIM)"
+        )
+    if agent_findings:
+        add_heading("Agent Findings", 3)
+        add_table(
+            ["#", "Finding / Required Review"],
+            [
+                [index, finding]
+                for index, finding in enumerate(agent_findings, start=1)
+            ],
+        )
 
 detected_nvas = {}
 classification_by_resource_id = {
