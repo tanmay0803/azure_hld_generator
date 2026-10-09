@@ -28,8 +28,22 @@
 #   HLD_REGION="UAE North"
 #   SUBSCRIPTION_IDS="<id1>,<id2>" to limit inventory to selected subscriptions
 #   REUSE_INVENTORY="1" to skip Azure discovery and reuse inventory.json
+#   DISCOVERY_ENABLED=0 (default) to skip Azure discovery/inventory and authenticate
+#     only for Foundry access using the FOUNDRY_* credentials from the Foundry tenant.
+#   Set DISCOVERY_ENABLED=1 only when you explicitly want Azure inventory in the
+#     current Cloud Shell tenant or in the configured discovery tenant.
 #   MG_STRUCTURE_FILE="./management_group_structure.txt" for portal-pasted evidence
 #   MG_STRUCTURE_IMAGE="./management_group_structure.png" for portal screenshot evidence
+#   DISCOVERY_TENANT_ID=<tenant-id-for-Azure-inventory>
+#   DISCOVERY_CLIENT_ID=<inventory-app-registration-client-id>
+#   DISCOVERY_CLIENT_SECRET=<inventory-client-secret>
+#   DISCOVERY_SUBSCRIPTION_ID=<subscription-id-to-select-for-inventory>
+#   FOUNDRY_TENANT_ID=<tenant-id-for-Foundry>
+#   FOUNDRY_CLIENT_ID=<foundry-app-registration-client-id>
+#   FOUNDRY_CLIENT_SECRET=<foundry-client-secret>
+#   FOUNDRY_SUBSCRIPTION_ID=<optional-subscription-selector-for-Foundry-login>
+#   AZURE_TENANT_ID/AZURE_CLIENT_ID/AZURE_CLIENT_SECRET/AZURE_SUBSCRIPTION_ID are
+#   still accepted as legacy aliases for backward compatibility.
 #   FOUNDRY_PROJECT_ENDPOINT, FOUNDRY_AGENT_NAME, FOUNDRY_AGENT_VERSION
 #   FOUNDRY_MAX_INPUT_CHARS=9000 to set the serialized evidence batch size
 #   FOUNDRY_TRACING_ENABLED=0 to disable OpenTelemetry traces (enabled by default)
@@ -66,6 +80,8 @@ if [[ -f "$ENV_FILE" ]]; then
 fi
 MODEL_ENRICHMENT_ENABLED="${MODEL_ENRICHMENT_ENABLED:-${AGENT_ENRICHMENT_ENABLED:-1}}"
 export MODEL_ENRICHMENT_ENABLED
+DISCOVERY_ENABLED="${DISCOVERY_ENABLED:-0}"
+export DISCOVERY_ENABLED
 
 MG_ID="${1:-}"
 TEMPLATE="${2:-Esolutions_LLD_v0.2.docx}"
@@ -94,6 +110,29 @@ if ! command -v python3 >/dev/null 2>&1; then
   exit 1
 fi
 
+login_with_service_principal() {
+  local tenant_id="${1:-${DISCOVERY_TENANT_ID:-${AZURE_TENANT_ID:-}}}"
+  local client_id="${2:-${DISCOVERY_CLIENT_ID:-${AZURE_CLIENT_ID:-}}}"
+  local client_secret="${3:-${DISCOVERY_CLIENT_SECRET:-${AZURE_CLIENT_SECRET:-}}}"
+  local subscription_id="${4:-${DISCOVERY_SUBSCRIPTION_ID:-${AZURE_SUBSCRIPTION_ID:-}}}"
+
+  if [[ -z "$tenant_id" || -z "$client_id" || -z "$client_secret" ]]; then
+    return 1
+  fi
+
+  echo "Authenticating with service principal from tenant: $tenant_id"
+  az login --service-principal \
+    --username "$client_id" \
+    --password "$client_secret" \
+    --tenant "$tenant_id" >/dev/null || return 1
+
+  if [[ -n "$subscription_id" ]]; then
+    az account set --subscription "$subscription_id" >/dev/null || return 1
+  fi
+
+  return 0
+}
+
 if [[ "$MODEL_ENRICHMENT_ENABLED" != "0" ]] &&
    ! python3 -c "from azure.ai.projects import AIProjectClient; from azure.identity import DefaultAzureCredential; from openai import RateLimitError" >/dev/null 2>&1; then
   echo "[AI] SKIPPED: Foundry Agent dependencies are unavailable; continuing without AI analysis."
@@ -108,9 +147,50 @@ if [[ ! -f "$TEMPLATE" ]]; then
 fi
 
 echo "Checking Azure login..."
-if ! az account show >/dev/null 2>&1; then
-  echo "Not logged in. Running 'az login'..."
-  az login >/dev/null || exit 1
+if [[ "${DISCOVERY_ENABLED:-0}" == "0" ]]; then
+  if [[ -n "${FOUNDRY_TENANT_ID:-}" || -n "${FOUNDRY_CLIENT_ID:-}" || -n "${FOUNDRY_CLIENT_SECRET:-}" ]]; then
+    echo "Discovery disabled (DISCOVERY_ENABLED=0). Authenticating only for Foundry access."
+    login_with_service_principal \
+      "${FOUNDRY_TENANT_ID:-${AZURE_TENANT_ID:-}}" \
+      "${FOUNDRY_CLIENT_ID:-${AZURE_CLIENT_ID:-}}" \
+      "${FOUNDRY_CLIENT_SECRET:-${AZURE_CLIENT_SECRET:-}}" \
+      "${FOUNDRY_SUBSCRIPTION_ID:-${AZURE_SUBSCRIPTION_ID:-}}" || {
+        echo "ERROR: Could not authenticate with the Foundry service principal." >&2
+        exit 1
+      }
+  else
+    echo "Discovery disabled and no Foundry service principal credentials were supplied. Exiting without Azure inventory."
+    exit 0
+  fi
+  echo "Azure discovery is disabled; skipping inventory and management-group scanning."
+  exit 0
+fi
+
+if az account show >/dev/null 2>&1; then
+  auth_tenant="$(az account show --query tenantId -o tsv 2>/dev/null || true)"
+  desired_tenant="${DISCOVERY_TENANT_ID:-${AZURE_TENANT_ID:-}}"
+  if [[ -n "$desired_tenant" && -n "$auth_tenant" && "$auth_tenant" != "$desired_tenant" ]]; then
+    echo "Current session tenant ($auth_tenant) does not match the discovery tenant ($desired_tenant). Re-authenticating with the configured inventory service principal..."
+    login_with_service_principal \
+      "${DISCOVERY_TENANT_ID:-${AZURE_TENANT_ID:-}}" \
+      "${DISCOVERY_CLIENT_ID:-${AZURE_CLIENT_ID:-}}" \
+      "${DISCOVERY_CLIENT_SECRET:-${AZURE_CLIENT_SECRET:-}}" \
+      "${DISCOVERY_SUBSCRIPTION_ID:-${AZURE_SUBSCRIPTION_ID:-}}" || {
+        echo "ERROR: Could not authenticate with the configured discovery service principal." >&2
+        exit 1
+      }
+  fi
+else
+  if login_with_service_principal \
+    "${DISCOVERY_TENANT_ID:-${AZURE_TENANT_ID:-}}" \
+    "${DISCOVERY_CLIENT_ID:-${AZURE_CLIENT_ID:-}}" \
+    "${DISCOVERY_CLIENT_SECRET:-${AZURE_CLIENT_SECRET:-}}" \
+    "${DISCOVERY_SUBSCRIPTION_ID:-${AZURE_SUBSCRIPTION_ID:-}}"; then
+    echo "Authenticated with the discovery service principal."
+  else
+    echo "Not logged in. Running 'az login'..."
+    az login >/dev/null || exit 1
+  fi
 fi
 
 # TMP_DIR="$(mktemp -d)"
@@ -2167,6 +2247,13 @@ def invoke_network_design_agent(subscriptions):
     )
     agent_name = os.environ.get("FOUNDRY_AGENT_NAME", "LLD-agent")
     agent_version = os.environ.get("FOUNDRY_AGENT_VERSION", "1")
+    foundry_tenant_id = os.environ.get("FOUNDRY_TENANT_ID") or os.environ.get("AZURE_TENANT_ID")
+    foundry_client_id = os.environ.get("FOUNDRY_CLIENT_ID") or os.environ.get("AZURE_CLIENT_ID")
+    foundry_client_secret = os.environ.get("FOUNDRY_CLIENT_SECRET") or os.environ.get("AZURE_CLIENT_SECRET")
+    if foundry_tenant_id and foundry_client_id and foundry_client_secret:
+        os.environ["AZURE_TENANT_ID"] = foundry_tenant_id
+        os.environ["AZURE_CLIENT_ID"] = foundry_client_id
+        os.environ["AZURE_CLIENT_SECRET"] = foundry_client_secret
     if not project_endpoint.strip():
         raise ValueError("FOUNDRY_PROJECT_ENDPOINT must not be empty.")
     if not agent_name.strip():
