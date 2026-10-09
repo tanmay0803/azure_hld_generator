@@ -43,7 +43,7 @@
 #   FOUNDRY_CLIENT_SECRET=<foundry-client-secret>
 #   FOUNDRY_SUBSCRIPTION_ID=<optional-subscription-selector-for-Foundry-login>
 #   AZURE_TENANT_ID/AZURE_CLIENT_ID/AZURE_CLIENT_SECRET/AZURE_SUBSCRIPTION_ID are
-#   still accepted as legacy aliases for backward compatibility.
+#   accepted only as legacy aliases for Foundry authentication, never discovery.
 #   FOUNDRY_PROJECT_ENDPOINT, FOUNDRY_AGENT_NAME, FOUNDRY_AGENT_VERSION
 #   FOUNDRY_MAX_INPUT_CHARS=9000 to set the serialized evidence batch size
 #   FOUNDRY_TRACING_ENABLED=0 to disable OpenTelemetry traces (enabled by default)
@@ -110,11 +110,45 @@ if ! command -v python3 >/dev/null 2>&1; then
   exit 1
 fi
 
+ensure_foundry_python_dependencies() {
+  if python3 -c "from azure.ai.projects import AIProjectClient; from azure.identity import DefaultAzureCredential; from openai import RateLimitError" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  echo "[AI] Installing Foundry Agent dependencies: azure-ai-projects, azure-identity, openai"
+  python3 -m pip install --user "azure-ai-projects>=2.1.0" azure-identity openai >/dev/null 2>&1 || {
+    echo "[AI] Failed to install Foundry Agent dependencies automatically."
+    echo 'Install them manually with: python3 -m pip install "azure-ai-projects>=2.1.0" azure-identity openai'
+    return 1
+  }
+
+  return 0
+}
+
+ensure_appinsights_python_dependency() {
+  if [[ -z "${APPLICATIONINSIGHTS_CONNECTION_STRING:-}" ]]; then
+    return 0
+  fi
+
+  if python3 -c "from azure.monitor.opentelemetry import configure_azure_monitor" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  echo "[AI] Installing Azure Monitor OpenTelemetry dependency for Application Insights."
+  python3 -m pip install --user azure-monitor-opentelemetry >/dev/null 2>&1 || {
+    echo "[AI] Failed to install azure-monitor-opentelemetry automatically."
+    echo 'Install it manually with: python3 -m pip install azure-monitor-opentelemetry'
+    return 1
+  }
+
+  return 0
+}
+
 login_with_service_principal() {
-  local tenant_id="${1:-${DISCOVERY_TENANT_ID:-${AZURE_TENANT_ID:-}}}"
-  local client_id="${2:-${DISCOVERY_CLIENT_ID:-${AZURE_CLIENT_ID:-}}}"
-  local client_secret="${3:-${DISCOVERY_CLIENT_SECRET:-${AZURE_CLIENT_SECRET:-}}}"
-  local subscription_id="${4:-${DISCOVERY_SUBSCRIPTION_ID:-${AZURE_SUBSCRIPTION_ID:-}}}"
+    local tenant_id="${1:-}"
+    local client_id="${2:-}"
+    local client_secret="${3:-}"
+    local subscription_id="${4:-}"
 
   if [[ -z "$tenant_id" || -z "$client_id" || -z "$client_secret" ]]; then
     return 1
@@ -133,12 +167,16 @@ login_with_service_principal() {
   return 0
 }
 
-if [[ "$MODEL_ENRICHMENT_ENABLED" != "0" ]] &&
-   ! python3 -c "from azure.ai.projects import AIProjectClient; from azure.identity import DefaultAzureCredential; from openai import RateLimitError" >/dev/null 2>&1; then
-  echo "[AI] SKIPPED: Foundry Agent dependencies are unavailable; continuing without AI analysis."
-  echo 'Install them with: python3 -m pip install "azure-ai-projects>=2.1.0" azure-identity openai'
-  MODEL_ENRICHMENT_ENABLED=0
-  export MODEL_ENRICHMENT_ENABLED
+if [[ "$MODEL_ENRICHMENT_ENABLED" != "0" ]]; then
+  if ! ensure_foundry_python_dependencies; then
+    echo "[AI] SKIPPED: Foundry Agent dependencies are unavailable; continuing without AI analysis."
+    MODEL_ENRICHMENT_ENABLED=0
+    export MODEL_ENRICHMENT_ENABLED
+  fi
+fi
+
+if ! ensure_appinsights_python_dependency; then
+  echo "[AI] App Insights telemetry will remain disabled because azure-monitor-opentelemetry is unavailable."
 fi
 
 if [[ ! -f "$TEMPLATE" ]]; then
@@ -162,30 +200,33 @@ if [[ "${DISCOVERY_ENABLED:-0}" == "0" ]]; then
     echo "Discovery disabled and no Foundry service principal credentials were supplied. Exiting without Azure inventory."
     exit 0
   fi
-  echo "Azure discovery is disabled; skipping inventory and management-group scanning."
-  exit 0
+    if [[ "${REUSE_INVENTORY:-0}" != "1" ]]; then
+        echo "Azure discovery is disabled; skipping inventory and management-group scanning."
+        exit 0
+    fi
+    echo "Azure discovery is disabled; continuing with the existing inventory."
 fi
 
 if az account show >/dev/null 2>&1; then
   auth_tenant="$(az account show --query tenantId -o tsv 2>/dev/null || true)"
-  desired_tenant="${DISCOVERY_TENANT_ID:-${AZURE_TENANT_ID:-}}"
+    desired_tenant="${DISCOVERY_TENANT_ID:-}"
   if [[ -n "$desired_tenant" && -n "$auth_tenant" && "$auth_tenant" != "$desired_tenant" ]]; then
     echo "Current session tenant ($auth_tenant) does not match the discovery tenant ($desired_tenant). Re-authenticating with the configured inventory service principal..."
     login_with_service_principal \
-      "${DISCOVERY_TENANT_ID:-${AZURE_TENANT_ID:-}}" \
-      "${DISCOVERY_CLIENT_ID:-${AZURE_CLIENT_ID:-}}" \
-      "${DISCOVERY_CLIENT_SECRET:-${AZURE_CLIENT_SECRET:-}}" \
-      "${DISCOVERY_SUBSCRIPTION_ID:-${AZURE_SUBSCRIPTION_ID:-}}" || {
+            "${DISCOVERY_TENANT_ID:-}" \
+            "${DISCOVERY_CLIENT_ID:-}" \
+            "${DISCOVERY_CLIENT_SECRET:-}" \
+            "${DISCOVERY_SUBSCRIPTION_ID:-}" || {
         echo "ERROR: Could not authenticate with the configured discovery service principal." >&2
         exit 1
       }
   fi
 else
   if login_with_service_principal \
-    "${DISCOVERY_TENANT_ID:-${AZURE_TENANT_ID:-}}" \
-    "${DISCOVERY_CLIENT_ID:-${AZURE_CLIENT_ID:-}}" \
-    "${DISCOVERY_CLIENT_SECRET:-${AZURE_CLIENT_SECRET:-}}" \
-    "${DISCOVERY_SUBSCRIPTION_ID:-${AZURE_SUBSCRIPTION_ID:-}}"; then
+        "${DISCOVERY_TENANT_ID:-}" \
+        "${DISCOVERY_CLIENT_ID:-}" \
+        "${DISCOVERY_CLIENT_SECRET:-}" \
+        "${DISCOVERY_SUBSCRIPTION_ID:-}"; then
     echo "Authenticated with the discovery service principal."
   else
     echo "Not logged in. Running 'az login'..."
@@ -318,50 +359,40 @@ def walk(node, parent_path=None):
 walk(tree)
 
 #
-# If MG traversal finds nothing
-# fall back to accessible subscriptions
+# Some CLI versions return subscriptions separately from the expanded tree.
+# Keep the lookup management-group-scoped; never fall back to all account subscriptions.
 #
 if len(subscriptions) == 0:
-
-    print(
-        "MG traversal returned 0 subscriptions."
-        " Using az account list fallback.",
-        file=sys.stderr
-    )
-
-    p = subprocess.run(
+    for sid_obj in run(
         [
             "az",
             "account",
-            "list",
+            "management-group",
+            "subscription",
+            "show",
+            "--name",
+            MG_ID,
             "-o",
-            "json"
+            "json",
         ],
-        stdout=subprocess.PIPE,
-        text=True
+        default=[],
+    ) or []:
+        if isinstance(sid_obj, dict):
+            sid = sid_obj.get("name") or sid_obj.get("id", "").split("/")[-1]
+            if sid:
+                subscriptions.setdefault(sid, {
+                    "subscription_id": sid,
+                    "management_group_path": MG_ID,
+                    "management_group": MG_ID,
+                })
+
+if not subscriptions:
+    print(
+        f"ERROR: No subscriptions were returned beneath management group {MG_ID}. "
+        "Stopping without scanning subscriptions visible to the signed-in account.",
+        file=sys.stderr,
     )
-
-    all_subs = json.loads(
-        p.stdout
-    )
-
-    for sub in all_subs:
-
-        sid = sub.get("id")
-
-        if not sid:
-            continue
-
-        subscriptions[sid] = {
-
-            "subscription_id": sid,
-
-            "management_group_path":
-                MG_ID,
-
-            "management_group":
-                MG_ID
-        }
+    sys.exit(1)
 
 subs = sorted(
     subscriptions.values(),
@@ -375,19 +406,6 @@ print(
     f"subscription(s).",
     file=sys.stderr
 )
-# Some CLI versions return subscriptions in a separate list instead of the
-# recursively expanded tree. Merge those if present.
-for sid_obj in run(["az","account","management-group","subscription","show",
-                    "--name",MG_ID,"-o","json"], default=[]) or []:
-    if isinstance(sid_obj, dict):
-        sid = sid_obj.get("name") or sid_obj.get("id","").split("/")[-1]
-        if sid:
-            subscriptions.setdefault(sid, {
-                "subscription_id": sid,
-                "management_group_path": MG_ID,
-                "management_group": MG_ID
-            })
-
 selected_subscription_ids = {
     sid.strip().lower()
     for sid in os.environ.get("SUBSCRIPTION_IDS", "").split(",")
@@ -938,7 +956,99 @@ for idx, s in enumerate(subs, 1):
     log_workspaces = az_for_sub(sid, ["monitor","log-analytics","workspace","list"], [])
     app_insights = az_for_sub(sid, ["monitor","app-insights","component","list"], [])
     action_groups = az_for_sub(sid, ["monitor","action-group","list"], [])
-    recovery_vaults = az_for_sub(sid, ["backup","vault","list"], [])
+    recovery_vault_result = run_azure_cli_json(
+        sid,
+        ["backup", "vault", "list"],
+        "Recovery Services vaults",
+    )
+    if isinstance(recovery_vault_result, list):
+        recovery_vaults = recovery_vault_result
+    elif isinstance(recovery_vault_result, dict) and isinstance(
+        recovery_vault_result.get("value"), list
+    ):
+        recovery_vaults = recovery_vault_result["value"]
+    else:
+        recovery_vaults = []
+    backup_items = []
+    backup_policies = []
+    backup_collection_status = []
+    if recovery_vault_result is None:
+        backup_collection_status.append({
+            "vaultName": "Recovery Services vault discovery",
+            "resourceGroup": "Subscription scope",
+            "itemsStatus": "Unavailable",
+            "policiesStatus": "Unavailable",
+        })
+    for vault in recovery_vaults or []:
+        vault_name = str(vault.get("name") or "")
+        vault_resource_group = str(vault.get("resourceGroup") or "")
+        if not vault_resource_group:
+            resource_id_parts = str(vault.get("id") or "").split("/")
+            vault_resource_group = next(
+                (
+                    resource_id_parts[index + 1]
+                    for index, part in enumerate(resource_id_parts[:-1])
+                    if part.lower() == "resourcegroups"
+                ),
+                "",
+            )
+        if not vault_name or not vault_resource_group:
+            backup_collection_status.append({
+                "vaultName": vault_name or "Unknown",
+                "resourceGroup": vault_resource_group or "Unknown",
+                "itemsStatus": "Unavailable: vault name or resource group not reported",
+                "policiesStatus": "Unavailable: vault name or resource group not reported",
+            })
+            continue
+
+        vault_status = {
+            "vaultName": vault_name,
+            "resourceGroup": vault_resource_group,
+        }
+        for command_name, args, destination, status_key in (
+            (
+                "backup items",
+                [
+                    "backup", "item", "list",
+                    "--resource-group", vault_resource_group,
+                    "--vault-name", vault_name,
+                ],
+                backup_items,
+                "itemsStatus",
+            ),
+            (
+                "backup policies",
+                [
+                    "backup", "policy", "list",
+                    "--resource-group", vault_resource_group,
+                    "--vault-name", vault_name,
+                ],
+                backup_policies,
+                "policiesStatus",
+            ),
+        ):
+            result = run_azure_cli_json(
+                sid,
+                args,
+                f"{command_name} for Recovery Services vault {vault_name}",
+            )
+            if isinstance(result, list):
+                records = result
+                vault_status[status_key] = "Collected"
+            elif isinstance(result, dict) and isinstance(result.get("value"), list):
+                records = result["value"]
+                vault_status[status_key] = "Collected"
+            else:
+                records = []
+                vault_status[status_key] = "Unavailable"
+            for record in records:
+                if not isinstance(record, dict):
+                    continue
+                record.setdefault("vaultName", vault_name)
+                record.setdefault("vaultResourceGroup", vault_resource_group)
+                record.setdefault("subscriptionId", sid)
+                destination.append(record)
+        backup_collection_status.append(vault_status)
     policy_assignments = az_for_sub(sid, ["policy","assignment","list"], [])
     policy_definitions = az_for_sub(sid, ["policy","definition","list"], [])
     role_assignments = az_for_sub(sid, ["role","assignment","list"], [])
@@ -1137,11 +1247,56 @@ for idx, s in enumerate(subs, 1):
     #
     # Standard Logic Apps
     #
-    all_resources = az_for_sub(
+    all_resources_result = run_azure_cli_json(
         sid,
         ["resource", "list"],
-        []
+        "ARM resources for backup and replication inventory",
     )
+    if isinstance(all_resources_result, list):
+        all_resources_status = "Collected"
+        all_resources = all_resources_result
+    elif isinstance(all_resources_result, dict) and isinstance(
+        all_resources_result.get("value"), list
+    ):
+        all_resources_status = "Collected"
+        all_resources = all_resources_result["value"]
+    else:
+        all_resources_status = "Unavailable"
+        all_resources = []
+    if all_resources_status == "Unavailable":
+        backup_collection_status.append({
+            "vaultName": "ARM replication and Data Protection resource inventory",
+            "resourceGroup": "Subscription scope",
+            "itemsStatus": "Unavailable",
+            "policiesStatus": "Unavailable",
+        })
+    replication_item_type = (
+        "microsoft.recoveryservices/vaults/replicationfabrics/"
+        "replicationprotectioncontainers/replicationprotecteditems"
+    )
+    replicated_items = [
+        resource
+        for resource in all_resources
+        if str(resource.get("type", "")).lower() == replication_item_type
+    ]
+    data_protection_vaults = [
+        resource
+        for resource in all_resources
+        if str(resource.get("type", "")).lower()
+        == "microsoft.dataprotection/backupvaults"
+    ]
+    data_protection_backup_instances = [
+        resource
+        for resource in all_resources
+        if str(resource.get("type", "")).lower()
+        == "microsoft.dataprotection/backupvaults/backupinstances"
+    ]
+    data_protection_backup_policies = [
+        resource
+        for resource in all_resources
+        if str(resource.get("type", "")).lower()
+        == "microsoft.dataprotection/backupvaults/backuppolicies"
+    ]
     sql_databases = []
     for resource in all_resources:
         if str(resource.get("type", "")).lower() != (
@@ -1422,6 +1577,14 @@ Resources
         "application_insights": app_insights,
         "action_groups": action_groups,
         "recovery_vaults": recovery_vaults,
+        "backup_items": backup_items,
+        "backup_policies": backup_policies,
+        "backup_collection_status": backup_collection_status,
+        "arm_backup_resource_query_status": all_resources_status,
+        "replicated_items": replicated_items,
+        "data_protection_vaults": data_protection_vaults,
+        "data_protection_backup_instances": data_protection_backup_instances,
+        "data_protection_backup_policies": data_protection_backup_policies,
         "policy_assignments": policy_assignments,
         "policy_definitions": policy_definitions,
         "role_assignments": role_assignments,
@@ -1517,6 +1680,32 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.enum.table import WD_TABLE_ALIGNMENT, WD_CELL_VERTICAL_ALIGNMENT
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
+
+app_insights_meter_provider = None
+app_insights_run_counter = None
+connection_string = os.environ.get("APPLICATIONINSIGHTS_CONNECTION_STRING", "").strip()
+if connection_string:
+    try:
+        from azure.monitor.opentelemetry import configure_azure_monitor
+        from opentelemetry import metrics
+
+        configure_azure_monitor(connection_string=connection_string)
+        app_insights_meter_provider = metrics.get_meter_provider()
+        app_insights_run_counter = metrics.get_meter(
+            "azure_hld_generator"
+        ).create_counter(
+            "hld_generation_runs",
+            unit="{run}",
+            description="HLD generation runs by status",
+        )
+        app_insights_run_counter.add(1, {"status": "started"})
+        print("[App Insights] Telemetry configured; recording HLD run metrics.")
+    except Exception as error:
+        print(
+            f"[App Insights] Telemetry initialization failed: "
+            f"{type(error).__name__}: {error}",
+            file=sys.stderr,
+        )
 
 template = Path(os.environ["TEMPLATE"])
 output = Path(os.environ["OUTPUT"])
@@ -5794,6 +5983,282 @@ if detected_nvas:
         add_caption(f"{vendor} Azure-side topology")
 
 # ---------------------------------------------------------------------------
+# Backup and Disaster Recovery
+# ---------------------------------------------------------------------------
+def backup_value(record, *paths):
+    for path in paths:
+        value = record
+        for part in path.split("."):
+            if not isinstance(value, dict) or part not in value:
+                value = None
+                break
+            value = value[part]
+        if value not in (None, "", [], {}):
+            return (
+                json.dumps(value, ensure_ascii=False, sort_keys=True)
+                if isinstance(value, (dict, list))
+                else str(value)
+            )
+    return "Not reported"
+
+
+def backup_resource_group(resource):
+    if resource.get("resourceGroup") or resource.get("resource_group"):
+        return resource.get("resourceGroup") or resource.get("resource_group")
+    parts = str(resource.get("id") or "").split("/")
+    return next(
+        (
+            parts[index + 1]
+            for index, part in enumerate(parts[:-1])
+            if part.lower() == "resourcegroups"
+        ),
+        "Not reported",
+    )
+
+
+backup_summary_rows = []
+vault_rows = []
+backup_item_rows = []
+backup_policy_rows = []
+replication_rows = []
+backup_query_rows = []
+data_protection_vault_rows = []
+data_protection_instance_rows = []
+data_protection_policy_rows = []
+for subscription in subs:
+    subscription_name = subscription.get(
+        "display_name", subscription.get("subscription_id", "")
+    )
+    inventory_section = subscription.get("inventory") or {}
+    vaults = inventory_section.get("recovery_vaults", []) or []
+    backup_items_for_sub = inventory_section.get("backup_items", []) or []
+    backup_policies_for_sub = inventory_section.get("backup_policies", []) or []
+    replicated_items_for_sub = inventory_section.get("replicated_items", []) or []
+    backup_summary_rows.append([
+        subscription_name,
+        len(vaults) if "recovery_vaults" in inventory_section else "Not collected",
+        len(backup_items_for_sub) if "backup_items" in inventory_section else "Not collected",
+        len(backup_policies_for_sub) if "backup_policies" in inventory_section else "Not collected",
+        len(replicated_items_for_sub) if "replicated_items" in inventory_section else "Not collected",
+    ])
+
+    for vault in vaults:
+        properties = vault.get("properties") or {}
+        redundancy = properties.get("redundancySettings") or {}
+        security = properties.get("securitySettings") or {}
+        immutability = security.get("immutabilitySettings") or {}
+        vault_rows.append([
+            vault.get("name", "Not reported"),
+            backup_resource_group(vault),
+            subscription_name,
+            vault.get("location", "Not reported"),
+            properties.get("provisioningState", "Not reported"),
+            properties.get("publicNetworkAccess", "Not reported"),
+            redundancy.get("standardTierStorageRedundancy", "Not reported"),
+            immutability.get("state", "Not reported"),
+        ])
+
+    for item in backup_items_for_sub:
+        backup_item_rows.append([
+            item.get("friendlyName", item.get("name", "Not reported")),
+            item.get("vaultName", "Not reported"),
+            subscription_name,
+            backup_value(item, "backupManagementType", "properties.backupManagementType"),
+            backup_value(item, "workloadType", "properties.workloadType"),
+            backup_value(item, "protectionState", "properties.protectionState"),
+            backup_value(item, "protectionStatus", "properties.protectionStatus"),
+            backup_value(item, "healthStatus", "properties.healthStatus"),
+            backup_value(item, "lastBackupStatus", "properties.lastBackupStatus"),
+            backup_value(item, "lastBackupTime", "properties.lastBackupTime"),
+            backup_value(item, "policyName", "properties.policyName"),
+            backup_value(item, "protectedItemDataSourceId", "properties.protectedItemDataSourceId"),
+        ])
+
+    for policy in backup_policies_for_sub:
+        properties = policy.get("properties") or {}
+        backup_policy_rows.append([
+            policy.get("name", "Not reported"),
+            policy.get("vaultName", "Not reported"),
+            subscription_name,
+            backup_value(policy, "backupManagementType", "properties.backupManagementType"),
+            backup_value(policy, "workloadType", "properties.workloadType"),
+            backup_value(policy, "policySubType", "properties.policySubType"),
+            backup_value(policy, "schedulePolicy", "properties.schedulePolicy"),
+            backup_value(policy, "retentionPolicy", "properties.retentionPolicy"),
+            backup_value(policy, "timeZone", "properties.timeZone"),
+        ])
+
+    for item in replicated_items_for_sub:
+        properties = item.get("properties") or {}
+        provider_details = properties.get("providerSpecificDetails") or {}
+        health_errors = (
+            properties.get("healthErrors")
+            or provider_details.get("healthErrors")
+            or []
+        )
+        if isinstance(health_errors, list):
+            health_error_summary = "; ".join(
+                str(error.get("errorCode") or error.get("message") or error.get("summary") or "Health issue")
+                if isinstance(error, dict)
+                else str(error)
+                for error in health_errors
+            ) or "None reported"
+        else:
+            health_error_summary = str(health_errors)
+        replication_rows.append([
+            item.get("name", "Not reported"),
+            backup_resource_group(item),
+            subscription_name,
+            item.get("location", "Not reported"),
+            backup_value(item, "properties.friendlyName", "properties.protectedItemName"),
+            backup_value(item, "properties.protectionState", "properties.protectionStateDescription"),
+            backup_value(item, "properties.replicationHealth", "properties.health", "properties.providerSpecificDetails.replicationHealth"),
+            backup_value(item, "properties.failoverHealth", "properties.providerSpecificDetails.failoverHealth"),
+            backup_value(item, "properties.lastSuccessfulFailoverTime", "properties.lastRpoCalculatedTime"),
+            health_error_summary,
+        ])
+
+    for status in inventory_section.get("backup_collection_status", []) or []:
+        backup_query_rows.append([
+            status.get("vaultName", "Not reported"),
+            status.get("resourceGroup", "Not reported"),
+            subscription_name,
+            status.get("itemsStatus", "Not reported"),
+            status.get("policiesStatus", "Not reported"),
+        ])
+    if "backup_collection_status" not in inventory_section:
+        backup_query_rows.append([
+            "Not collected",
+            "",
+            subscription_name,
+            "Legacy/reused inventory",
+            "Legacy/reused inventory",
+        ])
+
+    for vault in inventory_section.get("data_protection_vaults", []) or []:
+        properties = vault.get("properties") or {}
+        data_protection_vault_rows.append([
+            vault.get("name", "Not reported"),
+            backup_resource_group(vault),
+            subscription_name,
+            vault.get("location", "Not reported"),
+            properties.get("provisioningState", "Not reported"),
+            properties.get("storageSettings", "Not reported"),
+        ])
+
+    for instance in inventory_section.get("data_protection_backup_instances", []) or []:
+        properties = instance.get("properties") or {}
+        data_source = properties.get("dataSourceInfo") or {}
+        data_protection_instance_rows.append([
+            instance.get("name", "Not reported"),
+            backup_resource_group(instance),
+            subscription_name,
+            data_source.get("resourceName", "Not reported"),
+            backup_value(instance, "properties.currentProtectionState"),
+            backup_value(instance, "properties.protectionStatus"),
+            backup_value(instance, "properties.policyInfo.policyId", "properties.policyInfo.name"),
+        ])
+
+    for policy in inventory_section.get("data_protection_backup_policies", []) or []:
+        properties = policy.get("properties") or {}
+        data_protection_policy_rows.append([
+            policy.get("name", "Not reported"),
+            backup_resource_group(policy),
+            subscription_name,
+            properties.get("datasourceTypes", "Not reported"),
+            properties.get("policyRules", "Not reported"),
+        ])
+
+add_heading("Backup Solutions and Disaster Recovery", 1)
+add_para(
+    "This section inventories Azure Backup and Site Recovery configuration visible "
+    "to the signed-in identity. Protected-item states and replication health are "
+    "reported as exposed by Azure; a missing value is not treated as healthy or protected."
+)
+add_heading("Backup Coverage Summary", 2)
+add_table(
+    ["Subscription", "Recovery Services Vaults", "Protected Items", "Backup Policies", "Replicated Items"],
+    backup_summary_rows or [["No subscription inventory available", 0, 0, 0, 0]],
+)
+add_caption("Backup and Replication Coverage")
+
+add_heading("Recovery Services Vaults", 2)
+add_table(
+    ["Vault", "Resource Group", "Subscription", "Region", "Provisioning State", "Public Access", "Storage Redundancy", "Immutability"],
+    vault_rows or [["No Recovery Services Vaults returned", "", "", "", "", "", "", ""]],
+)
+add_caption("Recovery Services Vault Configuration")
+
+add_heading("Protected Backup Items", 2)
+add_table(
+    ["Item", "Vault", "Subscription", "Management Type", "Workload", "Protection State", "Protection Status", "Health", "Last Backup Status", "Last Backup Time", "Policy", "Protected Resource ID"],
+    backup_item_rows or [[
+        "No protected backup items returned"
+        if any("backup_items" in (subscription.get("inventory") or {}) for subscription in subs)
+        else "Not collected in this inventory"
+    ] + [""] * 11],
+)
+add_caption("Protected Backup Items")
+
+add_heading("Backup Policies", 2)
+add_table(
+    ["Policy", "Vault", "Subscription", "Management Type", "Workload", "Policy Type", "Schedule", "Retention", "Time Zone"],
+    backup_policy_rows or [[
+        "No backup policies returned"
+        if any("backup_policies" in (subscription.get("inventory") or {}) for subscription in subs)
+        else "Not collected in this inventory"
+    ] + [""] * 8],
+)
+add_caption("Recovery Services Backup Policies")
+
+add_heading("Azure Site Recovery Replicated Items", 2)
+add_table(
+    ["Replicated Item", "Resource Group", "Subscription", "Region", "Protected Resource", "Protection State", "Replication Health", "Failover Health", "Last RPO / Failover", "Health Errors"],
+    replication_rows or [[
+        "No replicated items returned"
+        if any("replicated_items" in (subscription.get("inventory") or {}) for subscription in subs)
+        else "Not collected in this inventory"
+    ] + [""] * 9],
+)
+add_caption("Azure Site Recovery Replication Status")
+
+add_heading("Data Protection Backup Vaults", 2)
+add_table(
+    ["Backup Vault", "Resource Group", "Subscription", "Region", "Provisioning State", "Storage Settings"],
+    data_protection_vault_rows or [[
+        "No Data Protection vaults returned"
+        if any("data_protection_vaults" in (subscription.get("inventory") or {}) for subscription in subs)
+        else "Not collected in this inventory"
+    ] + [""] * 5],
+)
+if data_protection_instance_rows:
+    add_heading("Data Protection Backup Instances", 3)
+    add_table(
+        ["Instance", "Resource Group", "Subscription", "Data Source", "Protection State", "Protection Status", "Policy ID / Name"],
+        data_protection_instance_rows,
+    )
+if data_protection_policy_rows:
+    add_heading("Data Protection Policies", 3)
+    add_table(
+        ["Policy", "Resource Group", "Subscription", "Data Source Types", "Policy Rules"],
+        data_protection_policy_rows,
+    )
+add_caption("Data Protection Vault Configuration")
+
+add_heading("Backup Collection Status", 2)
+add_para(
+    "Unavailable means the Azure CLI query failed or returned no parseable result; "
+    "it does not mean that the vault has no protected items or policies. Legacy "
+    "inventory files created before Backup collection was added require a fresh "
+    "discovery run to populate these details."
+)
+add_table(
+    ["Vault", "Resource Group", "Subscription", "Items Query", "Policies Query"],
+    backup_query_rows or [["No Recovery Services Vault queries performed", "", "", "", ""]],
+)
+add_caption("Per-Vault Backup Query Status")
+
+# ---------------------------------------------------------------------------
 # 6. IAM
 # ---------------------------------------------------------------------------
 add_heading("6. Identity and Access Management", 1)
@@ -6182,6 +6647,19 @@ for section in doc.sections:
 
 doc.save(str(output))
 print(f"Generated: {output}")
+if app_insights_run_counter is not None:
+    app_insights_run_counter.add(1, {"status": "completed"})
+    try:
+        flushed = app_insights_meter_provider.force_flush(timeout_millis=10000)
+        if flushed:
+            print("[App Insights] Flushed HLD run metrics.")
+        else:
+            print("[App Insights] Metric export did not confirm delivery.", file=sys.stderr)
+    except Exception as error:
+        print(
+            f"[App Insights] Metric flush failed: {type(error).__name__}: {error}",
+            file=sys.stderr,
+        )
 PY
 python_status=$?
 if [[ "$python_status" -ne 0 ]]; then
