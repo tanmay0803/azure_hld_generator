@@ -4,7 +4,8 @@
 # Template: Esolutions_LLD_v0.2.docx
 #
 # Purpose:
-#   1. Discover every subscription beneath a Management Group.
+#   1. Discover subscriptions beneath a Management Group, with an account-visible
+#      subscription fallback when Management Group discovery returns none.
 #   2. Inventory Azure infrastructure in every discovered subscription.
 #   3. Generate a Word HLD using the supplied DOCX as the formatting baseline.
 #
@@ -30,6 +31,8 @@
 #   REUSE_INVENTORY="1" to skip Azure discovery and reuse inventory.json
 #   DISCOVERY_ENABLED=0 (default) to skip Azure discovery/inventory and authenticate
 #     only for Foundry access using the FOUNDRY_* credentials from the Foundry tenant.
+#   DISCOVERY_FALLBACK_ALL_SUBSCRIPTIONS=1 (default) to inventory all enabled
+#     subscriptions visible to the signed-in identity if Management Group discovery returns none.
 #   Set DISCOVERY_ENABLED=1 only when you explicitly want Azure inventory in the
 #     current Cloud Shell tenant or in the configured discovery tenant.
 #   MG_STRUCTURE_FILE="./management_group_structure.txt" for portal-pasted evidence
@@ -49,8 +52,15 @@
 #   FOUNDRY_TRACING_ENABLED=0 to disable OpenTelemetry traces (enabled by default)
 #   FOUNDRY_OTEL_ENDPOINT=http://localhost:4318 for the OTLP HTTP collector
 #   AI_DEBUG_CITATIONS=1 to log rejected and available evidence citations
+#   AI_STE100_WEIGHTAGE=75 to set the ASD-STE100 writing-style priority (0-100)
 #   MODEL_ENRICHMENT_ENABLED=0 to skip Foundry agent design-note enrichment
 #   AGENT_ENRICHMENT_ENABLED remains accepted as a legacy setting
+#   FOUNDRY_IMAGE_GENERATION_ENABLED=1 to generate a Proposed Solution concept image
+#   FOUNDRY_IMAGE_ENDPOINT=<Azure OpenAI resource endpoint, e.g. https://<resource>.openai.azure.com>
+#   FOUNDRY_IMAGE_DEPLOYMENT=<image model deployment name, e.g. gpt-image-1-mini>
+#   FOUNDRY_IMAGE_API_VERSION=2025-04-01-preview (optional override)
+#   Image generation uses Microsoft Entra ID via DefaultAzureCredential; no API key
+#   is needed when the identity has permission to invoke the image deployment.
 #   The script automatically loads ENV_FILE (default: ./.env) when present.
 #   Optional Agent tracing packages:
 #   opentelemetry-instrumentation-openai-v2==2.1b0
@@ -71,30 +81,34 @@ set -uo pipefail
 
 ENV_FILE="${ENV_FILE:-.env}"
 if [[ -f "$ENV_FILE" ]]; then
-  set -a
-  source "$ENV_FILE" || {
+set -a
+source "$ENV_FILE" || {
     echo "ERROR: Could not load environment file: $ENV_FILE"
     exit 1
-  }
-  set +a
+}
+set +a
 fi
 MODEL_ENRICHMENT_ENABLED="${MODEL_ENRICHMENT_ENABLED:-${AGENT_ENRICHMENT_ENABLED:-1}}"
 export MODEL_ENRICHMENT_ENABLED
+FOUNDRY_IMAGE_GENERATION_ENABLED="${FOUNDRY_IMAGE_GENERATION_ENABLED:-1}"
+export FOUNDRY_IMAGE_GENERATION_ENABLED
 DISCOVERY_ENABLED="${DISCOVERY_ENABLED:-0}"
 export DISCOVERY_ENABLED
+DISCOVERY_FALLBACK_ALL_SUBSCRIPTIONS="${DISCOVERY_FALLBACK_ALL_SUBSCRIPTIONS:-1}"
+export DISCOVERY_FALLBACK_ALL_SUBSCRIPTIONS
 
 MG_ID="${1:-}"
 TEMPLATE="${2:-Esolutions_LLD_v0.2.docx}"
 OUTPUT="${3:-Azure_HLD_$(date +%Y%m%d_%H%M%S).docx}"
 
 if [[ -z "$MG_ID" ]]; then
-  echo "Usage: $0 <MANAGEMENT_GROUP_ID> [TEMPLATE_DOCX] [OUTPUT_DOCX]"
-  exit 1
+echo "Usage: $0 <MANAGEMENT_GROUP_ID> [TEMPLATE_DOCX] [OUTPUT_DOCX]"
+exit 1
 fi
 
 if ! command -v az >/dev/null 2>&1; then
-  echo "ERROR: Azure CLI (az) is required."
-  exit 1
+echo "ERROR: Azure CLI (az) is required."
+exit 1
 fi
 
 echo "Checking Azure Resource Graph extension..."
@@ -106,42 +120,42 @@ if ! az extension show --name resource-graph >/dev/null 2>&1; then
 fi
 
 if ! command -v python3 >/dev/null 2>&1; then
-  echo "ERROR: Python 3 is required."
-  exit 1
+echo "ERROR: Python 3 is required."
+exit 1
 fi
 
 ensure_foundry_python_dependencies() {
-  if python3 -c "from azure.ai.projects import AIProjectClient; from azure.identity import DefaultAzureCredential; from openai import RateLimitError" >/dev/null 2>&1; then
+if python3 -c "from azure.ai.projects import AIProjectClient; from azure.identity import DefaultAzureCredential; from openai import RateLimitError" >/dev/null 2>&1; then
     return 0
-  fi
+fi
 
-  echo "[AI] Installing Foundry Agent dependencies: azure-ai-projects, azure-identity, openai"
-  python3 -m pip install --user "azure-ai-projects>=2.1.0" azure-identity openai >/dev/null 2>&1 || {
+echo "[AI] Installing Foundry Agent dependencies: azure-ai-projects, azure-identity, openai"
+python3 -m pip install --user "azure-ai-projects>=2.1.0" azure-identity openai >/dev/null 2>&1 || {
     echo "[AI] Failed to install Foundry Agent dependencies automatically."
     echo 'Install them manually with: python3 -m pip install "azure-ai-projects>=2.1.0" azure-identity openai'
     return 1
-  }
+}
 
-  return 0
+return 0
 }
 
 ensure_appinsights_python_dependency() {
-  if [[ -z "${APPLICATIONINSIGHTS_CONNECTION_STRING:-}" ]]; then
+if [[ -z "${APPLICATIONINSIGHTS_CONNECTION_STRING:-}" ]]; then
     return 0
-  fi
+fi
 
-  if python3 -c "from azure.monitor.opentelemetry import configure_azure_monitor" >/dev/null 2>&1; then
+if python3 -c "from azure.monitor.opentelemetry import configure_azure_monitor" >/dev/null 2>&1; then
     return 0
-  fi
+fi
 
-  echo "[AI] Installing Azure Monitor OpenTelemetry dependency for Application Insights."
-  python3 -m pip install --user azure-monitor-opentelemetry >/dev/null 2>&1 || {
+echo "[AI] Installing Azure Monitor OpenTelemetry dependency for Application Insights."
+python3 -m pip install --user azure-monitor-opentelemetry >/dev/null 2>&1 || {
     echo "[AI] Failed to install azure-monitor-opentelemetry automatically."
     echo 'Install it manually with: python3 -m pip install azure-monitor-opentelemetry'
     return 1
-  }
+}
 
-  return 0
+return 0
 }
 
 login_with_service_principal() {
@@ -150,56 +164,56 @@ login_with_service_principal() {
     local client_secret="${3:-}"
     local subscription_id="${4:-}"
 
-  if [[ -z "$tenant_id" || -z "$client_id" || -z "$client_secret" ]]; then
+if [[ -z "$tenant_id" || -z "$client_id" || -z "$client_secret" ]]; then
     return 1
-  fi
+fi
 
-  echo "Authenticating with service principal from tenant: $tenant_id"
-  az login --service-principal \
+echo "Authenticating with service principal from tenant: $tenant_id"
+az login --service-principal \
     --username "$client_id" \
     --password "$client_secret" \
     --tenant "$tenant_id" >/dev/null || return 1
 
-  if [[ -n "$subscription_id" ]]; then
+if [[ -n "$subscription_id" ]]; then
     az account set --subscription "$subscription_id" >/dev/null || return 1
-  fi
+fi
 
-  return 0
+return 0
 }
 
-if [[ "$MODEL_ENRICHMENT_ENABLED" != "0" ]]; then
-  if ! ensure_foundry_python_dependencies; then
+if [[ "$MODEL_ENRICHMENT_ENABLED" != "0" || "$FOUNDRY_IMAGE_GENERATION_ENABLED" == "1" ]]; then
+if ! ensure_foundry_python_dependencies; then
     echo "[AI] SKIPPED: Foundry Agent dependencies are unavailable; continuing without AI analysis."
     MODEL_ENRICHMENT_ENABLED=0
     export MODEL_ENRICHMENT_ENABLED
-  fi
+fi
 fi
 
 if ! ensure_appinsights_python_dependency; then
-  echo "[AI] App Insights telemetry will remain disabled because azure-monitor-opentelemetry is unavailable."
+echo "[AI] App Insights telemetry will remain disabled because azure-monitor-opentelemetry is unavailable."
 fi
 
 if [[ ! -f "$TEMPLATE" ]]; then
-  echo "ERROR: Template not found: $TEMPLATE"
-  exit 1
+echo "ERROR: Template not found: $TEMPLATE"
+exit 1
 fi
 
 echo "Checking Azure login..."
 if [[ "${DISCOVERY_ENABLED:-0}" == "0" ]]; then
-  if [[ -n "${FOUNDRY_TENANT_ID:-}" || -n "${FOUNDRY_CLIENT_ID:-}" || -n "${FOUNDRY_CLIENT_SECRET:-}" ]]; then
+if [[ -n "${FOUNDRY_TENANT_ID:-}" || -n "${FOUNDRY_CLIENT_ID:-}" || -n "${FOUNDRY_CLIENT_SECRET:-}" ]]; then
     echo "Discovery disabled (DISCOVERY_ENABLED=0). Authenticating only for Foundry access."
     login_with_service_principal \
-      "${FOUNDRY_TENANT_ID:-${AZURE_TENANT_ID:-}}" \
-      "${FOUNDRY_CLIENT_ID:-${AZURE_CLIENT_ID:-}}" \
-      "${FOUNDRY_CLIENT_SECRET:-${AZURE_CLIENT_SECRET:-}}" \
-      "${FOUNDRY_SUBSCRIPTION_ID:-${AZURE_SUBSCRIPTION_ID:-}}" || {
+    "${FOUNDRY_TENANT_ID:-${AZURE_TENANT_ID:-}}" \
+    "${FOUNDRY_CLIENT_ID:-${AZURE_CLIENT_ID:-}}" \
+    "${FOUNDRY_CLIENT_SECRET:-${AZURE_CLIENT_SECRET:-}}" \
+    "${FOUNDRY_SUBSCRIPTION_ID:-${AZURE_SUBSCRIPTION_ID:-}}" || {
         echo "ERROR: Could not authenticate with the Foundry service principal." >&2
         exit 1
-      }
-  else
+    }
+else
     echo "Discovery disabled and no Foundry service principal credentials were supplied. Exiting without Azure inventory."
     exit 0
-  fi
+fi
     if [[ "${REUSE_INVENTORY:-0}" != "1" ]]; then
         echo "Azure discovery is disabled; skipping inventory and management-group scanning."
         exit 0
@@ -208,9 +222,9 @@ if [[ "${DISCOVERY_ENABLED:-0}" == "0" ]]; then
 fi
 
 if az account show >/dev/null 2>&1; then
-  auth_tenant="$(az account show --query tenantId -o tsv 2>/dev/null || true)"
+auth_tenant="$(az account show --query tenantId -o tsv 2>/dev/null || true)"
     desired_tenant="${DISCOVERY_TENANT_ID:-}"
-  if [[ -n "$desired_tenant" && -n "$auth_tenant" && "$auth_tenant" != "$desired_tenant" ]]; then
+if [[ -n "$desired_tenant" && -n "$auth_tenant" && "$auth_tenant" != "$desired_tenant" ]]; then
     echo "Current session tenant ($auth_tenant) does not match the discovery tenant ($desired_tenant). Re-authenticating with the configured inventory service principal..."
     login_with_service_principal \
             "${DISCOVERY_TENANT_ID:-}" \
@@ -219,19 +233,19 @@ if az account show >/dev/null 2>&1; then
             "${DISCOVERY_SUBSCRIPTION_ID:-}" || {
         echo "ERROR: Could not authenticate with the configured discovery service principal." >&2
         exit 1
-      }
-  fi
+    }
+fi
 else
-  if login_with_service_principal \
+if login_with_service_principal \
         "${DISCOVERY_TENANT_ID:-}" \
         "${DISCOVERY_CLIENT_ID:-}" \
         "${DISCOVERY_CLIENT_SECRET:-}" \
         "${DISCOVERY_SUBSCRIPTION_ID:-}"; then
     echo "Authenticated with the discovery service principal."
-  else
+else
     echo "Not logged in. Running 'az login'..."
     az login >/dev/null || exit 1
-  fi
+fi
 fi
 
 # TMP_DIR="$(mktemp -d)"
@@ -258,19 +272,19 @@ if [[ "${REUSE_INVENTORY:-0}" == "1" ]]; then
 else
 # --expand --recurse returns the management-group tree including descendants.
 if ! az account management-group show \
-      --name "$MG_ID" \
-      --expand \
-      --recurse \
-      -o json > "$DISCOVERY" 2>mg.err; then
+    --name "$MG_ID" \
+    --expand \
+    --recurse \
+    -o json > "$DISCOVERY" 2>mg.err; then
 
-  echo "WARNING: Could not read Management Group hierarchy."
-  echo "Falling back to accessible subscriptions."
+echo "WARNING: Could not read Management Group hierarchy."
+echo "Trying the Management Group-scoped subscription lookup."
 
-  echo "{}" > "$DISCOVERY"
+echo "{}" > "$DISCOVERY"
 fi
 
 
-python3 - <<'PY'
+python3 - <<'PY' || { echo "ERROR: Azure discovery failed. HLD generation stopped before document creation." >&2; exit 1; }
 import json, os, subprocess, sys
 from pathlib import Path
 
@@ -281,7 +295,7 @@ inventory_file = Path(os.environ["INVENTORY"])
 def run(cmd, default=None):
     try:
         p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                           text=True, check=False)
+                        text=True, check=False)
         if p.returncode != 0:
             return default if default is not None else []
         if not p.stdout.strip():
@@ -360,7 +374,6 @@ walk(tree)
 
 #
 # Some CLI versions return subscriptions separately from the expanded tree.
-# Keep the lookup management-group-scoped; never fall back to all account subscriptions.
 #
 if len(subscriptions) == 0:
     for sid_obj in run(
@@ -369,7 +382,7 @@ if len(subscriptions) == 0:
             "account",
             "management-group",
             "subscription",
-            "show",
+            "show-sub-under-mg",
             "--name",
             MG_ID,
             "-o",
@@ -387,9 +400,40 @@ if len(subscriptions) == 0:
                 })
 
 if not subscriptions:
+    if os.environ.get("DISCOVERY_FALLBACK_ALL_SUBSCRIPTIONS", "1") == "1":
+        print(
+            "WARNING: Management Group discovery returned no subscriptions; "
+            "falling back to enabled subscriptions visible to this Azure CLI identity.",
+            file=sys.stderr,
+        )
+        visible_subscriptions = run(
+            ["az", "account", "list", "--all", "-o", "json"],
+            default=[],
+        )
+        for subscription in visible_subscriptions or []:
+            if not isinstance(subscription, dict):
+                continue
+            if str(subscription.get("state", "Enabled")).lower() != "enabled":
+                continue
+            sid = str(subscription.get("id") or subscription.get("subscriptionId") or "").strip()
+            sid = sid.rsplit("/", 1)[-1]
+            if not sid:
+                continue
+            subscriptions[sid] = {
+                "subscription_id": sid,
+                "display_name": subscription.get("name", sid),
+                "management_group_path": (
+                    "Account-visible subscription fallback "
+                    "(Management Group membership unverified)"
+                ),
+                "management_group": "Not verified (account fallback)",
+            }
+
+if not subscriptions:
     print(
-        f"ERROR: No subscriptions were returned beneath management group {MG_ID}. "
-        "Stopping without scanning subscriptions visible to the signed-in account.",
+    f"ERROR: No subscriptions were discovered under Management Group {MG_ID} "
+    "or returned by 'az account list --all'. Verify the Management Group ID, "
+    "sign-in tenant, and subscription access.",
         file=sys.stderr,
     )
     sys.exit(1)
@@ -878,6 +922,14 @@ def normalize_disks(disks):
 inventory = {
     "generated_utc": __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat(),
     "management_group_id": MG_ID,
+    "discovery_scope": (
+        "account_visible_fallback"
+        if any(
+            item.get("management_group") == "Not verified (account fallback)"
+            for item in subs
+        )
+        else "management_group"
+    ),
     "subscriptions": []
 }
 
@@ -913,7 +965,7 @@ for idx, s in enumerate(subs, 1):
         vname = v.get("name")
         if vname:
             peerings.extend(az_for_sub(sid, ["network","vnet","peering","list","--vnet-name",vname,
-                                             "--resource-group",v.get("resourceGroup","")], []))
+                                            "--resource-group",v.get("resourceGroup","")], []))
     # The above command may fail where RG is absent in returned VNet JSON.
     # Retry peerings using the resource ID-derived RG if necessary.
     if not peerings:
@@ -922,7 +974,7 @@ for idx, s in enumerate(subs, 1):
             rg = v.get("resourceGroup")
             if vname and rg:
                 peerings.extend(az_for_sub(sid, ["network","vnet","peering","list",
-                                                 "--vnet-name",vname,"--resource-group",rg], []))
+                                                "--vnet-name",vname,"--resource-group",rg], []))
 
     vms = az_for_sub(sid, ["vm","list"], [])
     disks = arg_disks_for_sub(sid)
@@ -1188,7 +1240,7 @@ for idx, s in enumerate(subs, 1):
         ["monitor","activity-log","alert","list"],
         []
     )
-   
+
 
     metric_alerts = az_for_sub(
         sid,
@@ -1657,6 +1709,12 @@ fi
 
 echo "[DOCX] Generating HLD..."
 
+if [[ ! -f "$INVENTORY" ]]; then
+echo "ERROR: Inventory file not found: $INVENTORY" >&2
+echo "Azure discovery did not produce an inventory. Resolve the discovery errors above, or set REUSE_INVENTORY=1 and provide a valid inventory.json or resources.json." >&2
+exit 1
+fi
+
 echo "Checking python-docx..."
 
 python3 -c "import docx" >/dev/null 2>&1 || {
@@ -1680,6 +1738,76 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.enum.table import WD_TABLE_ALIGNMENT, WD_CELL_VERTICAL_ALIGNMENT
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
+
+def generate_proposed_solution_image():
+    """Generate an illustrative target-state image through an Azure OpenAI deployment."""
+    if os.environ.get("FOUNDRY_IMAGE_GENERATION_ENABLED", "1") != "1":
+        print("[Image] Disabled by FOUNDRY_IMAGE_GENERATION_ENABLED.")
+        return None
+
+    endpoint = os.environ.get("FOUNDRY_IMAGE_ENDPOINT", "").strip().rstrip("/")
+    deployment = os.environ.get("FOUNDRY_IMAGE_DEPLOYMENT", "").strip()
+    if not endpoint or not deployment:
+        print(
+            "[Image] Skipped: set FOUNDRY_IMAGE_ENDPOINT and "
+            "FOUNDRY_IMAGE_DEPLOYMENT to enable Proposed Solution image generation."
+        )
+        return None
+
+    try:
+        from azure.identity import DefaultAzureCredential, get_bearer_token_provider
+        from openai import AzureOpenAI
+
+        credential = DefaultAzureCredential()
+        try:
+            token_provider = get_bearer_token_provider(
+                credential, "https://cognitiveservices.azure.com/.default"
+            )
+            client = AzureOpenAI(
+                azure_endpoint=endpoint,
+                api_version=os.environ.get(
+                    "FOUNDRY_IMAGE_API_VERSION", "2025-04-01-preview"
+                ),
+                azure_ad_token_provider=token_provider,
+                timeout=180.0,
+                max_retries=2,
+            )
+            result = client.images.generate(
+                model=deployment,
+                prompt=(
+                    "Create a polished, landscape 16:9 conceptual cloud architecture "
+                    "illustration for an Azure enterprise target-state high-level design. "
+                    "Show a governance layer above separate platform/shared-services and "
+                    "workload subscription areas, connected through secure networking, "
+                    "identity, monitoring, and backup/resilience concepts. Use clean, "
+                    "professional vector-like shapes in Azure-inspired blues with subtle "
+                    "accents. Do not include text, labels, numbers, product logos, or "
+                    "claims that any specific service is currently deployed. This is a "
+                    "conceptual illustration, not an implementation diagram."
+                ),
+                n=1,
+                size="1536x1024",
+                quality="medium",
+                output_format="png",
+            )
+            image_data = result.data[0].b64_json
+            if not image_data:
+                raise RuntimeError("Image service returned no base64 image data.")
+            import base64
+
+            image_path = Path(os.environ["OUTPUT"]).with_suffix(".proposed-solution.png")
+            image_path.write_bytes(base64.b64decode(image_data, validate=True))
+            print(f"[Image] Generated Proposed Solution illustration: {image_path}")
+            return image_path
+        finally:
+            credential.close()
+    except Exception as error:
+        print(
+            f"[Image] Generation failed; continuing without the illustration: "
+            f"{type(error).__name__}: {error}",
+            file=sys.stderr,
+        )
+        return None
 
 app_insights_meter_provider = None
 app_insights_run_counter = None
@@ -1710,6 +1838,17 @@ if connection_string:
 template = Path(os.environ["TEMPLATE"])
 output = Path(os.environ["OUTPUT"])
 data = json.loads(Path(os.environ["INVENTORY"]).read_text())
+account_visible_fallback = data.get("discovery_scope") == "account_visible_fallback"
+if account_visible_fallback:
+    discovery_scope_description = (
+        "all enabled subscriptions visible to the signed-in Azure CLI identity; "
+        "their membership beneath the requested Management Group was not verified"
+    )
+else:
+    discovery_scope_description = (
+        f"subscriptions discovered beneath Management Group "
+        f"{data.get('management_group_id', '')}"
+    )
 SENSITIVE_KEY_PATTERN = re.compile(
     r"(?:password|secret|token|credential|private.?key|license.?key|"
     r"snmp.?community|registration.?key|api.?key|access.?key|"
@@ -2351,6 +2490,9 @@ def invoke_network_design_agent(subscriptions):
             re.IGNORECASE,
         )
     ]
+    def normalize_resource_id(resource_id):
+        return str(resource_id or "").strip().rstrip("/").casefold()
+
     known_resource_ids = {}
     for subscription in subscriptions:
         for resources in (subscription.get("inventory") or {}).values():
@@ -2359,8 +2501,9 @@ def invoke_network_design_agent(subscriptions):
             for resource in resources:
                 if isinstance(resource, dict) and isinstance(resource.get("id"), str):
                     resource_id = resource["id"].strip()
-                    if resource_id:
-                        known_resource_ids[resource_id.lower()] = resource_id
+                    normalized_resource_id = normalize_resource_id(resource_id)
+                    if normalized_resource_id:
+                        known_resource_ids[normalized_resource_id] = resource_id
     def find_known_resource_ids(value):
         found = set()
         if isinstance(value, dict):
@@ -2677,16 +2820,22 @@ def invoke_network_design_agent(subscriptions):
             resource["resource_id"].lower(): resource
             for resource in batch_evidence["resources"]
         }
+        try:
+            ste100_weightage = int(os.environ.get("AI_STE100_WEIGHTAGE", "75"))
+        except ValueError as error:
+            raise ValueError("AI_STE100_WEIGHTAGE must be an integer from 0 to 100.") from error
+        if not 0 <= ste100_weightage <= 100:
+            raise ValueError("AI_STE100_WEIGHTAGE must be an integer from 0 to 100.")
         prompt = f"""
 Follow the architecture-analysis instructions configured on this Foundry Agent.
 Use only the supplied Azure inventory as observed Azure evidence. Return one
 strict JSON object matching this response contract:
 
 {{
-  "vnet_notes": "string",
-  "subnet_notes": "string",
-  "apim_notes": "string",
-  "resource_classifications": [{{
+"vnet_notes": "string",
+"subnet_notes": "string",
+"apim_notes": "string",
+"resource_classifications": [{{
     "resource_id": "exact supplied Azure resource ID",
     "resource_name": "string",
     "azure_resource_type": "string",
@@ -2698,42 +2847,55 @@ strict JSON object matching this response contract:
     "environment": "string",
     "confidence": 0.0,
     "evidence": [{{
-      "attribute": "string",
-      "value": "string",
-      "source": "azure_inventory",
-      "evidence": "specific supplied fact"
+    "attribute": "string",
+    "value": "string",
+    "source": "azure_inventory",
+    "evidence": "specific supplied fact"
     }}],
     "relationships": [{{
-      "relationship": "string",
-      "target_resource": "exact Azure resource ID present in supplied evidence",
-      "purpose": "string"
+    "relationship": "string",
+    "target_resource": "exact Azure resource ID present in supplied evidence",
+    "purpose": "string"
     }}],
     "architecture_observations": ["string"],
     "recommendations": ["string"],
     "required_validation": ["string"],
     "well_architected_assessment": [{{
-      "pillar": "Reliability | Security | Cost Optimization | Operational Excellence | Performance Efficiency",
-      "observed": "concise Azure-inventory observation",
-      "recommendation": "evidence-grounded action",
-      "required_validation": "specific follow-up check",
-      "priority": "High | Medium | Low | Informational",
-      "evidence": [{{
+    "pillar": "Reliability | Security | Cost Optimization | Operational Excellence | Performance Efficiency",
+    "observed": "concise Azure-inventory observation",
+    "recommendation": "evidence-grounded action",
+    "required_validation": "specific follow-up check",
+    "priority": "High | Medium | Low | Informational",
+    "evidence": [{{
         "attribute": "string",
         "value": "string",
         "source": "azure_inventory",
         "evidence": "specific supplied fact"
-      }}]
     }}]
-  }}],
-  "architecture_summary": {{
+    }}]
+}}],
+"architecture_summary": {{
     "network_architecture": ["string"],
     "security_architecture": ["string"],
     "application_delivery": ["string"],
     "connectivity": ["string"],
     "high_availability": ["string"]
-  }},
-  "findings": ["string"]
+}},
+"findings": ["string"]
 }}
+
+ASD-STE100 writing requirement:
+Give ASD-STE100 Simplified Technical English a {ste100_weightage}% priority in
+the style of all natural-language text that you author in this JSON response.
+Write short, direct sentences. Prefer active voice, one main idea per sentence,
+consistent terms, and simple words. Avoid idioms, vague wording, unnecessary
+abbreviations, and complex sentence structures. Keep Azure product names,
+resource names, identifiers, schema keys, and quoted inventory values exactly
+as supplied. Do not simplify technical facts in a way that changes their meaning.
+Evidence accuracy, required fields, and valid JSON remain mandatory. Apply the
+writing rules as closely as possible, but do not claim formal ASD-STE100
+compliance: the controlled dictionary and a rule-based STE checker are not
+provided to this Agent.
 
 Return exactly one classification for every item in "resources", and no others.
 Preserve resource IDs, names and Azure resource types exactly as supplied.
@@ -2767,10 +2929,11 @@ for missing evidence unless a material issue is directly observed. Keep each
 assessment to one pillar and avoid duplicating the general observations,
 recommendations, or required_validation arrays.
 
-Evidence citations may reference a scalar field nested in a supplied resource
-object using a dotted attribute path such as "sku.capacity". Cite the exact
-scalar value from the supplied inventory, even if the classification evidence
-also summarizes its parent object as a combined value.
+For each Well-Architected assessment, copy its evidence citation object(s)
+exactly from that resource classification's "evidence" array. Do not create a
+new attribute name, paraphrase a value, or change its capitalization. A citation
+may use a dotted path such as "sku.capacity" only when that exact path and value
+are present in the classification evidence or supplied resource facts.
 
 For every sql_servers resource, include Security review coverage for the
 reported publicNetworkAccess value, Microsoft Entra administrator configuration
@@ -3208,10 +3371,24 @@ Design evidence:
                         "assessment row."
                     )
                 assessment_evidence = []
+                citation_error = None
                 for citation in assessment["evidence"]:
-                    assessment_evidence.append(
-                        match_validated_citation(citation)
+                    try:
+                        assessment_evidence.append(
+                            match_validated_citation(citation)
+                        )
+                    except RuntimeError as error:
+                        citation_error = error
+                        break
+                if citation_error:
+                    print(
+                        "WARNING: Discarding a Well-Architected assessment "
+                        "because its evidence citation did not match the "
+                        "validated Azure inventory. The remaining Agent "
+                        "analysis will be retained.",
+                        file=sys.stderr,
                     )
+                    continue
                 validated_assessments.append({
                     **assessment,
                     "evidence": assessment_evidence,
@@ -3232,12 +3409,15 @@ Design evidence:
                     raise RuntimeError(
                         "Foundry Agent returned a malformed resource relationship."
                     )
-                target_id = relationship["target_resource"].strip().lower()
+                target_id = normalize_resource_id(relationship["target_resource"])
                 if target_id not in known_resource_ids:
-                    raise RuntimeError(
-                        "Foundry Agent relationship references a resource ID "
-                        "not present in the collected inventory."
+                    print(
+                        "WARNING: Discarding an Agent relationship because its "
+                        "target resource ID is not present in the collected "
+                        "inventory. The resource classification will be retained.",
+                        file=sys.stderr,
                     )
+                    continue
                 validated_relationships.append({
                     **relationship,
                     "target_resource": known_resource_ids[target_id],
@@ -3727,14 +3907,14 @@ def alert_targets_resource(alert, resource):
     Determine whether an alert applies to the Azure resource.
 
     Supports:
-      1. Direct resource-level alert scope
-      2. Resource-group scoped alerts targeting the resource type
-      3. Subscription scoped alerts targeting the resource type
+    1. Direct resource-level alert scope
+    2. Resource-group scoped alerts targeting the resource type
+    3. Subscription scoped alerts targeting the resource type
 
     Applies to:
-      - Metric Alerts
-      - Activity Log Alerts
-      - Log Query / Scheduled Query Alerts
+    - Metric Alerts
+    - Activity Log Alerts
+    - Log Query / Scheduled Query Alerts
     """
 
     resource_id = str(
@@ -3894,14 +4074,14 @@ def alert_targets_resource(alert, resource):
     Determine whether an alert applies to the Azure resource.
 
     Supports:
-      1. Direct resource-level alert scope
-      2. Resource-group scoped alerts targeting the resource type
-      3. Subscription scoped alerts targeting the resource type
+    1. Direct resource-level alert scope
+    2. Resource-group scoped alerts targeting the resource type
+    3. Subscription scoped alerts targeting the resource type
 
     Applies to:
-      - Metric Alerts
-      - Activity Log Alerts
-      - Log Query / Scheduled Query Alerts
+    - Metric Alerts
+    - Activity Log Alerts
+    - Log Query / Scheduled Query Alerts
     """
 
     resource_id = str(
@@ -5339,7 +5519,7 @@ p._p.append(fld)
 add_heading("1. Introduction", 1)
 add_para(
     "This High Level Architecture document describes the current Azure cloud "
-    "foundation discovered beneath the specified Management Group. It provides "
+    f"foundation discovered from {discovery_scope_description}. It provides "
     "an environment-wide view of subscriptions, management-group hierarchy, "
     "networking, compute, storage, identity, security, monitoring, governance "
     "and supporting Azure services."
@@ -5351,12 +5531,14 @@ add_para(
 )
 add_heading("1.1 Scope", 2)
 add_para(
-    f"Management Group in scope: {data.get('management_group_id','')}. "
-    f"The generator discovered {len(subs)} subscription(s) beneath this scope."
+    f"Requested Management Group: {data.get('management_group_id','')}. "
+    f"The generator included {len(subs)} subscription(s) from {discovery_scope_description}."
 )
 add_para(
-    "The scope covers all subscriptions returned by the Management Group hierarchy "
-    "query and the Azure resources readable within each subscription."
+    "The scope covers the Azure resources readable within each included subscription."
+    if account_visible_fallback
+    else "The scope covers subscriptions returned by the Management Group hierarchy query "
+    "and the Azure resources readable within each subscription."
 )
 add_heading("1.2 Target Audience", 2)
 add_para(
@@ -5381,20 +5563,113 @@ add_caption("Table 1: Intended Audience")
 # ---------------------------------------------------------------------------
 add_heading("2. Proposed Solution", 1)
 add_para(
-    "The Azure estate is represented as a Management Group hierarchy containing "
-    "multiple subscriptions. Workloads and shared platform services are separated "
-    "by subscription boundaries, while Azure native networking and security "
-    "services provide controlled connectivity and centralized governance."
+    f"The proposed design is based on the Azure estate visible to this run: "
+    f"{len(subs)} subscription(s) were included in scope. The inventory describes "
+    "the current control-plane state; recommendations below are target-state "
+    "guidance and must be validated against application requirements, connectivity "
+    "constraints, recovery objectives, and the organization's security standards."
 )
-add_bullets([
-    "Management Group is the governance boundary for subscription-level organization.",
-    "Subscriptions provide workload, platform, security and operational isolation.",
-    "Virtual networks and subnets provide network segmentation.",
-    "VNet peering, routing and security controls determine east-west and north-south traffic paths.",
-    "Azure Firewall / Application Gateway / Front Door resources, where present, provide inspection and ingress capabilities.",
-    "Azure Monitor, Log Analytics, Application Insights and action groups, where present, provide observability.",
-    "Azure Policy assignments and RBAC assignments provide governance and access control."
-])
+add_heading("2.1 Target Architecture", 2)
+proposed_solution_image = generate_proposed_solution_image()
+if proposed_solution_image:
+    try:
+        doc.add_picture(str(proposed_solution_image), width=Inches(6.4))
+        add_caption("Figure: Illustrative Azure target-state architecture (AI-generated)")
+        add_para(
+            "This image is a conceptual illustration generated from the target-state "
+            "guidance below. It is not evidence of deployed Azure resources or a "
+            "validated implementation design."
+        )
+    except Exception as error:
+        print(
+            f"[Image] Could not embed the Proposed Solution illustration: {error}",
+            file=sys.stderr,
+        )
+add_para(
+    "Organize the estate under the approved Management Group hierarchy, with "
+    "subscriptions assigned to clear platform, shared-service, and workload "
+    "ownership boundaries. Keep production and non-production workloads isolated "
+    "where required by risk, access, policy, or lifecycle. Use the discovered "
+    "subscription and resource inventory as the baseline for validating this target "
+    "structure rather than assuming unobserved services are deployed."
+)
+
+add_heading("2.2 Governance and Subscription Design", 2)
+add_para(
+    "Apply Azure Policy initiatives at the narrowest Management Group scope that "
+    "provides consistent enforcement. Define subscription vending, naming, required "
+    "tags, allowed regions, diagnostic settings, and security baselines as repeatable "
+    "platform controls. Use separate subscriptions for workload or environment "
+    "boundaries when they materially improve ownership, cost allocation, or blast-radius "
+    "control. Review inherited assignments and exceptions before enforcement."
+)
+
+add_heading("2.3 Network and Connectivity", 2)
+add_para(
+    "Use a hub-and-spoke or Azure Virtual WAN topology only where it matches the "
+    "observed estate and connectivity requirements. Centralize shared DNS, ingress, "
+    "egress inspection, and hybrid connectivity in governed network services; connect "
+    "workload VNets using explicitly approved peerings or virtual WAN connections. "
+    "Segment subnets by workload tier and apply NSGs and route tables at deliberate "
+    "boundaries. Prefer private endpoints for supported PaaS dependencies, with private "
+    "DNS zones linked to the consuming networks. Validate effective routes, firewall "
+    "paths, and DNS resolution end to end."
+)
+
+add_heading("2.4 Compute, Applications, and Data", 2)
+add_para(
+    "Select App Service, Functions, Container Apps, AKS, or virtual machines according "
+    "to application runtime, operational ownership, scaling profile, and portability "
+    "requirements; do not move workloads between platforms solely to standardize the "
+    "inventory. Use managed identities for service-to-service access, private network "
+    "integration where required, and platform autoscaling with tested capacity limits. "
+    "For databases and storage, define SKU and availability choices from measured "
+    "workload demand, data residency, performance, and recovery requirements."
+)
+
+add_heading("2.5 Identity and Security", 2)
+add_para(
+    "Use Microsoft Entra ID as the control-plane identity provider and grant least "
+    "privilege through groups and scoped RBAC assignments. Protect privileged access "
+    "with PIM and periodic access reviews. Store application secrets and certificates "
+    "in Key Vault, prefer managed identities over embedded credentials, and restrict "
+    "public network access where supported. Combine Azure Policy, Defender for Cloud, "
+    "network controls, and workload-level security testing; validate each control "
+    "against the organization's approved baseline."
+)
+
+add_heading("2.6 Backup, Resilience, and Disaster Recovery", 2)
+add_para(
+    "Define recovery point and recovery time objectives per workload before selecting "
+    "backup frequency, retention, redundancy, and replication scope. Protect supported "
+    "VMs, databases, and file workloads with Recovery Services or Data Protection "
+    "vault policies appropriate to their data and compliance requirements. Monitor "
+    "protected-item health, last successful backup, and Azure Site Recovery replication "
+    "health where used. Perform scheduled restore and failover tests; vault presence or "
+    "a configured policy alone does not prove recoverability."
+)
+
+add_heading("2.7 Monitoring and Operations", 2)
+add_para(
+    "Use Azure Monitor and Log Analytics for platform diagnostics, metrics, and alert "
+    "correlation. Instrument application request, dependency, failure, and availability "
+    "signals with Application Insights where appropriate. Route actionable alerts to "
+    "owned action groups, define service health and backup failure response procedures, "
+    "and retain logs according to operational and regulatory requirements. Validate "
+    "diagnostic settings and alert coverage for each critical resource class."
+)
+
+add_heading("2.8 Delivery Approach", 2)
+add_table(
+    ["Phase", "Work", "Exit Evidence"],
+    [
+        ["1. Validate", "Confirm workload owners, dependencies, regions, identity boundaries, and RPO/RTO.", "Approved scope and requirements register."],
+        ["2. Establish platform", "Review Management Groups, subscription boundaries, policy, RBAC, network, and shared services.", "Validated landing-zone controls and connectivity tests."],
+        ["3. Onboard workloads", "Apply workload-specific compute, data, private access, monitoring, and backup configuration.", "Deployment checks, security review, and restore evidence."],
+        ["4. Operate and improve", "Review cost, alerts, capacity, backup health, access, and recovery exercises.", "Named owners, runbooks, and periodic review results."],
+    ],
+)
+add_caption("Proposed Solution Delivery Phases")
 
 # ---------------------------------------------------------------------------
 # 3. Azure Configuration
@@ -5402,8 +5677,7 @@ add_bullets([
 add_heading("3. Azure Configuration", 1)
 add_heading("3.1 Subscription", 2)
 add_para(
-    "The following table is generated from the Management Group hierarchy and "
-    "therefore represents all discovered subscriptions rather than a fixed project list."
+"The following table represents all included subscriptions rather than a fixed project list."
 )
 rows = []
 for s in subs:
@@ -5434,7 +5708,11 @@ add_table(["Azure Region","Observed Use"], [[r, "Resources discovered in this re
 add_caption("Table 3: Azure Regions")
 
 add_heading("3.2 Azure Management Groups", 2)
-add_para("Management Group hierarchy discovered from Azure:")
+add_para(
+"Subscriptions discovered from Azure:"
+if account_visible_fallback
+else "Management Group hierarchy discovered from Azure:"
+)
 add_table(
     ["Management Group Path","Subscription","Subscription ID"],
     [[s.get("management_group_path",""),s.get("display_name",""),s.get("subscription_id","")] for s in subs]
@@ -5656,12 +5934,12 @@ for s in subs:
 
 add_table(
 [
- "Route Table",
- "Resource Group",
- "Subscription",
- "Location",
- "Route Count",
- "Configured Routes"
+"Route Table",
+"Resource Group",
+"Subscription",
+"Location",
+"Route Count",
+"Configured Routes"
 ],
 rt_rows
 )
@@ -5758,7 +6036,7 @@ for s in subs:
     add_table(
                 ["VM Name","Resource Group","Location","Size","OS","Image","Zone","Public Access"],
         [[v.get("name",""),v.get("resource_group",""),v.get("location",""),v.get("size",""),
-          v.get("os_type",""),((v.get("image") or {}).get("offer","") + " " + (v.get("image") or {}).get("sku","")).strip(),
+        v.get("os_type",""),((v.get("image") or {}).get("offer","") + " " + (v.get("image") or {}).get("sku","")).strip(),
                     v.get("zone",""),v.get("public_access","Unknown")] for v in vms]
     )
     add_caption(f"Virtual Machines: {s.get('display_name','')}")
@@ -6640,7 +6918,12 @@ settings.append(update)
 for section in doc.sections:
     if section.footer.paragraphs:
         fp = section.footer.paragraphs[0]
-        fp.text = f"Generated from Azure Management Group {data.get('management_group_id','')} | {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
+        generation_scope = (
+            "account-visible subscriptions (Management Group membership unverified)"
+            if account_visible_fallback
+            else f"Azure Management Group {data.get('management_group_id', '')}"
+        )
+        fp.text = f"Generated from {generation_scope} | {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
         fp.alignment = WD_ALIGN_PARAGRAPH.CENTER
         for r in fp.runs:
             r.font.size = Pt(7)
@@ -6663,8 +6946,8 @@ if app_insights_run_counter is not None:
 PY
 python_status=$?
 if [[ "$python_status" -ne 0 ]]; then
-  echo "ERROR: HLD generation failed (Python exit code $python_status)." >&2
-  exit "$python_status"
+echo "ERROR: HLD generation failed (Python exit code $python_status)." >&2
+exit "$python_status"
 fi
 
 echo
