@@ -1,4 +1,5 @@
 #!/bin/bash
+# Made by TIM
 # ==============================================================================
 # Azure Management Group -> HLD Generator
 # Template: Esolutions_LLD_v0.2.docx
