@@ -1388,6 +1388,25 @@ for idx, s in enumerate(subs, 1):
         ]
         for inventory_key, resource_type in resource_types.items()
     }
+    additional_resource_types = {
+        "vm_snapshots": {"microsoft.compute/snapshots"},
+        "sql_pools": {
+            "microsoft.sql/servers/elasticpools",
+            "microsoft.synapse/workspaces/sqlpools",
+        },
+        "databricks_workspaces": {"microsoft.databricks/workspaces"},
+        "sql_virtual_machines": {"microsoft.sqlvirtualmachine/sqlvirtualmachines"},
+        "stream_analytics_jobs": {"microsoft.streamanalytics/streamingjobs"},
+        "nat_gateways": {"microsoft.network/natgateways"},
+    }
+    additional_resources = {
+        inventory_key: [
+            resource
+            for resource in all_resources
+            if str(resource.get("type", "")).lower() in resource_type_names
+        ]
+        for inventory_key, resource_type_names in additional_resource_types.items()
+    }
 
     logic_app_standard = [
         r
@@ -1619,6 +1638,7 @@ Resources
         "aks_clusters": platform_resources["aks_clusters"],
         "aro_clusters": platform_resources["aro_clusters"],
         "vm_scale_sets": platform_resources["vm_scale_sets"],
+        "vm_snapshots": additional_resources["vm_snapshots"],
         "disks": disks,
         "storage_accounts": storage,
         "key_vaults": kvs,
@@ -1650,12 +1670,17 @@ Resources
         "sql_servers": sql_servers,
         "sql_databases": sql_databases,
         "sql_managed_instances": sql_managed_instances,
+        "sql_pools": additional_resources["sql_pools"],
         "postgres_servers": postgres_servers,
         "mysql_servers": mysql_servers,
         "cosmos_accounts": cosmos_accounts,
         "data_factories": data_factories,
         "service_bus": service_bus,
         "event_hubs": event_hubs,
+        "databricks_workspaces": additional_resources["databricks_workspaces"],
+        "sql_virtual_machines": additional_resources["sql_virtual_machines"],
+        "stream_analytics_jobs": additional_resources["stream_analytics_jobs"],
+        "nat_gateways": additional_resources["nat_gateways"],
         "private_endpoints": private_endpoints,
         "private_dns_zones": private_dns_zones,
         "load_balancers": load_balancers,
@@ -5136,6 +5161,7 @@ RESOURCE_CATALOG = {
 
         },
         "application_gateways": generic_catalog_item("4.18 Application Gateways"),
+        "nat_gateways": generic_catalog_item("4.26 NAT Gateways"),
         "firewalls": generic_catalog_item("4.19 Azure Firewalls"),
         "firewall_policies": generic_catalog_item("4.20 Firewall Policies"),
         "frontdoor_profiles": generic_catalog_item("4.21 Front Door Profiles"),
@@ -5238,6 +5264,11 @@ RESOURCE_CATALOG = {
         },
         "sql_databases": generic_catalog_item("Azure SQL Databases"),
         "sql_managed_instances": generic_catalog_item("Azure SQL Managed Instances"),
+        "vm_snapshots": generic_catalog_item("5.22 VM Snapshots"),
+        "sql_pools": generic_catalog_item("5.23 SQL Pools"),
+        "databricks_workspaces": generic_catalog_item("5.24 Databricks Workspaces"),
+        "sql_virtual_machines": generic_catalog_item("5.25 SQL Virtual Machines"),
+        "stream_analytics_jobs": generic_catalog_item("5.26 Stream Analytics Jobs"),
         "postgres_servers": generic_catalog_item("5.14 PostgreSQL Servers"),
         "mysql_servers": generic_catalog_item("MySQL Flexible Servers"),
         "cosmos_accounts": generic_catalog_item("5.15 Cosmos DB Accounts"),
@@ -5267,6 +5298,7 @@ CATALOG_RESOURCE_GROUPS = {
         "load_balancers",
         "private_dns_zones",
         "bastions",
+        "nat_gateways",
         "network_interfaces",
         "network_watchers"
     },
@@ -5286,6 +5318,11 @@ CATALOG_RESOURCE_GROUPS = {
         "sql_servers",
         "sql_databases",
         "sql_managed_instances",
+        "vm_snapshots",
+        "sql_pools",
+        "databricks_workspaces",
+        "sql_virtual_machines",
+        "stream_analytics_jobs",
         "postgres_servers",
         "mysql_servers",
         "cosmos_accounts",
@@ -6701,6 +6738,7 @@ add_para(
 additional_monitoring_resources = [
     ("Resource Groups", "resource_groups"),
     ("Managed Disks", "disks"),
+    ("VM Snapshots", "vm_snapshots"),
     ("Key Vaults", "key_vaults"),
     ("App Services", "app_services"),
     ("Function Apps", "function_apps"),
@@ -6709,6 +6747,10 @@ additional_monitoring_resources = [
     ("Container App Environments", "container_app_environments"),
     ("Container Registries", "container_registries"),
     ("SQL Servers", "sql_servers"),
+    ("SQL Pools", "sql_pools"),
+    ("SQL Virtual Machines", "sql_virtual_machines"),
+    ("Databricks Workspaces", "databricks_workspaces"),
+    ("Stream Analytics Jobs", "stream_analytics_jobs"),
     ("PostgreSQL Servers", "postgres_servers"),
     ("Cosmos DB Accounts", "cosmos_accounts"),
     ("Data Factories", "data_factories"),
@@ -6721,6 +6763,7 @@ additional_monitoring_resources = [
     ("Private Endpoints", "private_endpoints"),
     ("Private DNS Zones", "private_dns_zones"),
     ("Bastion Hosts", "bastions"),
+    ("NAT Gateways", "nat_gateways"),
     ("Network Interfaces", "network_interfaces"),
     ("Network Watchers", "network_watchers"),
     ("Firewall Policies", "firewall_policies"),
